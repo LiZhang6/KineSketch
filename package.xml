@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+
+    <!-- For information about the contents of this file see
+    https://freecad.github.io/Addon-Academy/Topics/Structuring/Manifest/ -->
+
+    <!--[ Info ]-->
+
+    <name>KineSketch</name>
+    <description>KineSketch does something cool.</description>
+    <version>0.1.0</version>
+    <date>2026-09-27</date>
+
+    <!--[ Ecosystem Requirements ]-->
+
+    <!--NOTE: Examples only, this Template does *not* actually require these versions -->
+    <freecadmin>1.1.1</freecadmin>
+    <pythonmin>3.10</pythonmin>
+
+    <!--[ Dependencies ]-->
+
+    <!--NOTE: Examples only, this Template does *not* actually require these -->
+    <!--
+    <depend type="python">numpy</depend>
+    <depend type="addon">Curves</depend>
+    <depend type="internal">draft</depend>
+    -->
+
+    <!--[ Tags ]-->
+    <!--
+    <tag>Template</tag>
+    <tag>Minimal</tag>
+    <tag>Example</tag>
+    -->
+
+    <!--[ Maintainers ]-->
+
+    <maintainer email="710559583@qq.com">me</maintainer>
+
+    <!--[ Authors ]-->
+
+    <author>me</author>
+    <!-- <author>Yet another author's name here</author> -->
+
+    <!--[ Licenses ]-->
+
+    <license file="LICENSE-Code">LGPL-2.1-or-later</license>
+    <license file="LICENSE-Assets">CC-BY-SA-4.0</license>
+
+    <!--[ Icon ]-->
+
+    <icon>freecad/KineSketch/resources/icons/KineSketch.svg</icon>
+
+    <!--[ Urls ]-->
+
+    <url type="repository" branch="main">git@github.com:LiZhang6/KineSketch.git</url>
+    <url type="documentation">git@github.com:LiZhang6/KineSketch.git/tree/main/freecad/KineSketch/resources/docs/</url>
+    <url type="bugtracker">git@github.com:LiZhang6/KineSketch.git/issues/</url>
+    <url type="readme">git@github.com:LiZhang6/KineSketch.git/refs/heads/main/freecad/KineSketch/resources/docs/Overview.md</url>
+
+    <!--[ Content ]-->
+
+    <content>
+        <other/>
+
+        <!-- Example stuff -->
+        <workbench>
+            <name>KineSketch</name>
+            <classname>KineSketchWorkbench</classname>
+            <description>Example workbench</description>
+            <subdirectory>./</subdirectory>
+            <icon>freecad/KineSketch/resources/icons/KineSketch-wb.svg</icon>
+        </workbench>
+
+    </content>
+
+</package>

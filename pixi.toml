@@ -1,0 +1,16 @@
+[project]
+authors = ["me <710559583@qq.com>"]
+channels = ["freecad/label/dev", "conda-forge"]
+description = "KineSketch does something cool."
+name = "freecad.KineSketch"
+platforms = ["osx-arm64", "linux-aarch64", "linux-64", "win-64", "osx-64"]
+version = "0.1.0"
+
+[pypi-dependencies]
+freecad-KineSketch = { path = ".", editable = true }
+
+[tasks]
+test = "python tests/tests.py"
+
+[dependencies]
+freecad = ">=1.0.0,<2"
