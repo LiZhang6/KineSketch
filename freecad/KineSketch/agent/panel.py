@@ -65,6 +65,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         connection = QtWidgets.QGroupBox(
             App.Qt.translate("KineSketch", "Model connection"), container
         )
+        self.model_connection = connection
         form = QtWidgets.QFormLayout(connection)
         self.endpoint_edit = QtWidgets.QLineEdit(
             self._settings.value(
@@ -137,6 +138,21 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         )
         self.prompt_edit.setMaximumHeight(110)
 
+        status_layout = QtWidgets.QHBoxLayout()
+        status_layout.setContentsMargins(2, 0, 2, 0)
+        self.status_indicator = QtWidgets.QLabel(container)
+        self.status_indicator.setFixedSize(10, 10)
+        self.status_indicator.setAccessibleName(
+            App.Qt.translate("KineSketch", "Agent status")
+        )
+        self.status_label = QtWidgets.QLabel(container)
+        status_layout.addWidget(self.status_indicator)
+        status_layout.addWidget(self.status_label, 1)
+
+        self.status_progress = QtWidgets.QProgressBar(container)
+        self.status_progress.setTextVisible(False)
+        self.status_progress.setFixedHeight(4)
+
         controls = QtWidgets.QHBoxLayout()
         self.clear_button = QtWidgets.QPushButton(
             App.Qt.translate("KineSketch", "Clear"), container
@@ -152,12 +168,15 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         layout.addWidget(connection)
         layout.addWidget(ssh_connection)
         layout.addWidget(self.transcript, 1)
+        layout.addLayout(status_layout)
+        layout.addWidget(self.status_progress)
         layout.addWidget(self.prompt_edit)
         layout.addLayout(controls)
         self.setWidget(container)
 
         self.send_button.clicked.connect(self._send)
         self.clear_button.clicked.connect(self._clear)
+        self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
 
     @QtCore.Slot()
     def _send(self) -> None:
@@ -167,15 +186,25 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         endpoint = self.endpoint_edit.text().strip()
         model = self.model_edit.text().strip()
         if not prompt:
+            self._set_status(
+                App.Qt.translate("KineSketch", "Enter a message"), "warning"
+            )
             return
         if not endpoint or not model:
             self._append("System", "Endpoint and model are required.")
+            self._set_status(
+                App.Qt.translate("KineSketch", "Configuration required"), "error"
+            )
             return
         if self.ssh_connection.isChecked() and (
             not self.ssh_host_edit.text().strip()
             or not self.ssh_user_edit.text().strip()
         ):
             self._append("System", "SSH server and username are required.")
+            self._set_status(
+                App.Qt.translate("KineSketch", "SSH configuration required"),
+                "error",
+            )
             return
 
         self._settings.setValue("endpoint", endpoint)
@@ -189,7 +218,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.prompt_edit.clear()
         self._request_model()
 
-    def _request_model(self) -> None:
+    def _request_model(self, status_message: str | None = None) -> None:
         ssh_config = None
         if self.ssh_connection.isChecked():
             ssh_config = SSHConfig(
@@ -204,8 +233,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             conversation_id=self._conversation_id,
             ssh=ssh_config,
         )
-        self.send_button.setEnabled(False)
-        self.send_button.setText(App.Qt.translate("KineSketch", "Working..."))
+        self._set_busy(True)
+        self._set_status(
+            status_message or App.Qt.translate("KineSketch", "Connecting to agent..."),
+            "busy",
+            busy=True,
+        )
 
         thread = QtCore.QThread(self)
         worker = _RequestWorker(config, self._session.request_messages)
@@ -227,6 +260,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         try:
             tool_calls = self._session.accept_assistant(message)
             if tool_calls:
+                self._set_status(
+                    App.Qt.translate("KineSketch", "Applying agent actions..."),
+                    "warning",
+                    busy=True,
+                )
                 for tool_call in tool_calls:
                     result = execute_tool_call(tool_call)
                     self._session.add_tool_result(str(tool_call.get("id", "")), result)
@@ -235,22 +273,31 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 return
             content = message.get("content") or ""
             self._append("KineSketch", str(content))
+            self._set_status(
+                App.Qt.translate("KineSketch", "Response received"), "ready"
+            )
         except Exception as error:
             self._append("System", str(error))
+            self._set_status(
+                App.Qt.translate("KineSketch", "Agent action failed"), "error"
+            )
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
         self._append("System", message)
+        self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
 
     @QtCore.Slot()
     def _request_finished(self) -> None:
         self._thread = None
         self._worker = None
-        self.send_button.setEnabled(True)
-        self.send_button.setText(App.Qt.translate("KineSketch", "Send"))
         if self._continue_after_finish:
             self._continue_after_finish = False
-            self._request_model()
+            self._request_model(
+                App.Qt.translate("KineSketch", "Sending action results...")
+            )
+            return
+        self._set_busy(False)
 
     @QtCore.Slot()
     def _clear(self) -> None:
@@ -259,10 +306,46 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._session.clear()
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
+        self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
 
     @staticmethod
     def _new_conversation_id() -> str:
         return f"kinesketch:{uuid4().hex}"
+
+    def _set_busy(self, busy: bool) -> None:
+        self.model_connection.setEnabled(not busy)
+        self.ssh_connection.setEnabled(not busy)
+        self.prompt_edit.setEnabled(not busy)
+        self.clear_button.setEnabled(not busy)
+        self.send_button.setEnabled(not busy)
+        self.send_button.setText(
+            App.Qt.translate("KineSketch", "Working...")
+            if busy
+            else App.Qt.translate("KineSketch", "Send")
+        )
+
+    def _set_status(self, message: str, state: str, *, busy: bool = False) -> None:
+        colors = {
+            "ready": "#2e7d32",
+            "busy": "#1976d2",
+            "warning": "#b26a00",
+            "error": "#c62828",
+        }
+        color = colors.get(state, "#6b7280")
+        self.status_indicator.setStyleSheet(
+            f"background-color: {color}; border-radius: 5px;"
+        )
+        self.status_label.setText(message)
+        if busy:
+            self.status_progress.setStyleSheet("")
+            self.status_progress.setRange(0, 0)
+        else:
+            self.status_progress.setRange(0, 1)
+            self.status_progress.setValue(0)
+            self.status_progress.setStyleSheet(
+                "QProgressBar { background: transparent; border: none; }"
+                "QProgressBar::chunk { background: transparent; }"
+            )
 
     def _append(self, speaker: str, text: str) -> None:
         cursor = self.transcript.textCursor()
