@@ -1,0 +1,49 @@
+"""Run native tests or the complete visual demo in FreeCAD GUI."""
+
+import json
+import os
+import runpy
+import sys
+import traceback
+import unittest
+from pathlib import Path
+
+root = Path(os.environ["KINESKETCH_PROJECT_ROOT"]).resolve()
+report_path = Path(os.environ["KINESKETCH_TEST_REPORT"]).resolve()
+sys.path.insert(0, str(root))
+
+if report_path.with_name("demo_request.json").is_file():
+    try:
+        runpy.run_path(str(root / "tests" / "run_freecad_demo.FCMacro"), run_name="__main__")
+    except BaseException:
+        payload = {"status": "failed", "exception": traceback.format_exc()}
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        from PySide import QtCore
+        import FreeCADGui as Gui
+        QtCore.QTimer.singleShot(0, Gui.getMainWindow().close)
+else:
+    try:
+        import FreeCAD as App
+
+        suite = unittest.defaultTestLoader.discover(str(root / "tests"), pattern="test_*.py")
+        test_result = unittest.TextTestRunner(verbosity=2).run(suite)
+        payload = {
+            "ok": test_result.wasSuccessful() and not test_result.skipped,
+            "freecad_version": App.Version()[:3],
+            "gui_up": bool(App.GuiUp),
+            "tests_run": test_result.testsRun,
+            "failures": [message for _, message in test_result.failures],
+            "errors": [message for _, message in test_result.errors],
+            "skipped": [reason for _, reason in test_result.skipped],
+        }
+    except BaseException:
+        payload = {"ok": False, "exception": traceback.format_exc()}
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    from PySide import QtCore
+    import FreeCADGui as Gui
+
+    QtCore.QTimer.singleShot(0, Gui.getMainWindow().close)

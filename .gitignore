@@ -30,6 +30,10 @@ wheels/
 .venv
 venv/
 ENV/
+/.pixi/
 
 # other caches
 .ruff_cache/
+
+# Generated mechanism runs (source FCStd resources elsewhere remain trackable)
+/outputs/

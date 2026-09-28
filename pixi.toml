@@ -1,4 +1,4 @@
-[project]
+[workspace]
 authors = ["me <710559583@qq.com>"]
 channels = ["freecad/label/dev", "conda-forge"]
 description = "An AI agent integrated into FreeCAD for parametric modeling."
@@ -10,7 +10,17 @@ version = "0.1.0"
 freecad-KineSketch = { path = ".", editable = true }
 
 [tasks]
-test = "python tests/tests.py"
+test = "python -m unittest discover -s tests -p test_*.py -v"
+
+[target.win-64.tasks]
+test-native = "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_freecad_gui_test.ps1"
+demo-native = "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_freecad_demo.ps1"
+
+[target.win-64.activation.env]
+PYTHONPATH = "%CONDA_PREFIX%\\Library\\bin;%CONDA_PREFIX%\\Library\\mod\\Assembly;%PIXI_PROJECT_ROOT%"
 
 [dependencies]
 freecad = ">=1.0.0,<2"
+
+[target.win-64.dependencies]
+ffmpeg = ">=8,<9"
