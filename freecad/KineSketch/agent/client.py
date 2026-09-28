@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Small OpenAI-compatible chat client using only Python's standard library."""
+"""OpenAI-compatible HTTP client with optional SSH port forwarding."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+
+from .ssh_tunnel import SSHConfig, SSHTunnel
 
 
 class AgentClientError(RuntimeError):
@@ -24,6 +27,7 @@ class AgentConfig:
     api_key: str = ""
     conversation_id: str = ""
     timeout: float = 90.0
+    ssh: SSHConfig | None = None
 
     @property
     def chat_completions_url(self) -> str:
@@ -104,6 +108,38 @@ class OpenAICompatibleClient:
         return message
 
 
+class SSHTunneledAgentClient:
+    """Reach an HTTP agent endpoint through a key-authenticated SSH tunnel."""
+
+    def __init__(self, config: AgentConfig) -> None:
+        if config.ssh is None:
+            raise ValueError("SSH settings are required")
+        self.config = config
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        parsed = _parse_tunnel_endpoint(self.config.endpoint)
+        remote_port = parsed.port or 80
+        with SSHTunnel(self.config.ssh, parsed.hostname or "", remote_port) as tunnel:
+            local_endpoint = urlunsplit(
+                parsed._replace(netloc=f"127.0.0.1:{tunnel.local_port}")
+            )
+            direct_config = replace(self.config, endpoint=local_endpoint, ssh=None)
+            return OpenAICompatibleClient(direct_config).complete(messages, tools)
+
+
+def _parse_tunnel_endpoint(endpoint: str) -> SplitResult:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise ValueError("SSH tunnel endpoint must be an absolute HTTP URL")
+    return parsed
+
+
 def create_agent_client(config: AgentConfig) -> AgentClient:
     """Create the configured remote agent transport."""
+    if config.ssh is not None:
+        return SSHTunneledAgentClient(config)
     return OpenAICompatibleClient(config)

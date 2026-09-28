@@ -8,17 +8,19 @@ a dockable chat panel.
 
 - FreeCAD 1.0 or newer
 - An OpenAI-compatible chat-completions endpoint with tool-calling support
+- A system OpenSSH client available as `ssh`
 
 No third-party Python package is required inside FreeCAD. The model client uses
-Python's standard library.
+Python's standard library and the system OpenSSH client.
 
 ## Quick Start
 
-1. Install the addon with FreeCAD's Addon Manager or install this repository in
+1. Configure SSH key authentication and verify passwordless login to the server.
+2. Install the addon with FreeCAD's Addon Manager or install this repository in
 	the Pixi environment.
-2. Start FreeCAD and switch to the **KineSketch** workbench.
-3. Select **KineSketch > Open Agent** or use the KineSketch toolbar button.
-4. Enter an endpoint and model, then ask the agent to create or modify geometry.
+3. Start FreeCAD and switch to the **KineSketch** workbench.
+4. Select **KineSketch > Open Agent** or use the KineSketch toolbar button.
+5. Ask the agent to create or modify geometry.
 
 For an OpenClaw Gateway running on the same machine:
 
@@ -26,6 +28,38 @@ For an OpenClaw Gateway running on the same machine:
 Endpoint:     http://127.0.0.1:18789/v1
 Agent:        openclaw/default
 Access token: your OpenClaw Gateway token
+```
+
+The checked **SSH key tunnel** section is preconfigured for this deployment:
+
+```text
+Server:   61.172.235.130
+Port:     6010
+Username: asus_gx10
+```
+
+With SSH enabled, the endpoint identifies the Gateway from the remote server's
+point of view. The default `http://127.0.0.1:18789/v1` is forwarded through a
+random loopback port, so the Gateway does not need to be exposed publicly. The
+Gateway access token is kept only in the current panel and is never written to
+Qt settings or logs.
+
+KineSketch starts OpenSSH with batch mode, password authentication disabled, and
+strict host-key checking. It never reads a server password, private key, or key
+passphrase. Before opening the Agent panel, generate an RSA key and install its
+public key on the server:
+
+```bash
+ssh-keygen -t rsa
+ssh-copy-id -i ~/.ssh/id_rsa.pub -p 6010 asus_gx10@61.172.235.130
+```
+
+Enter the server password once when `ssh-copy-id` requests it. It also records
+the server in `known_hosts`. Then verify that this command succeeds without a
+password prompt:
+
+```bash
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p 6010 asus_gx10@61.172.235.130 exit
 ```
 
 The OpenClaw Chat Completions endpoint must be enabled on the Gateway:
@@ -42,9 +76,10 @@ The OpenClaw Chat Completions endpoint must be enabled on the Gateway:
 }
 ```
 
-For a remote deployment, use an HTTPS endpoint such as
-`https://agent.example.com/v1`. Keep the Gateway behind private ingress or an
-authenticated reverse proxy; its bearer token grants operator-level access.
+For a remote deployment without the built-in SSH tunnel, uncheck **SSH key tunnel**
+and use an HTTPS endpoint such as `https://agent.example.com/v1`. Keep the
+Gateway behind private ingress or an authenticated reverse proxy; its bearer
+token grants operator-level access.
 `openclaw/default` selects the default remote Agent, while
 `openclaw/<agentId>` selects a specific configured Agent. The underlying AI
 model and provider credentials remain entirely in the remote OpenClaw environment.
@@ -52,9 +87,12 @@ model and provider credentials remain entirely in the remote OpenClaw environmen
 These environment variables provide startup defaults:
 
 ```powershell
-$env:KINESKETCH_AGENT_ENDPOINT = "https://agent.example.com/v1"
+$env:KINESKETCH_AGENT_ENDPOINT = "http://127.0.0.1:18789/v1"
 $env:KINESKETCH_AGENT_ID = "openclaw/default"
 $env:KINESKETCH_AGENT_TOKEN = "..."
+$env:KINESKETCH_SSH_HOST = "61.172.235.130"
+$env:KINESKETCH_SSH_PORT = "6010"
+$env:KINESKETCH_SSH_USER = "asus_gx10"
 ```
 
 The endpoint and Agent ID are saved in local Qt settings. The access token is
@@ -67,9 +105,8 @@ OpenAI `user` field. OpenClaw therefore retains one remote session until the use
 presses **Clear**, which starts a new conversation.
 
 The transport boundary is `AgentClient` in
-`freecad/KineSketch/agent/client.py`. Its factory currently returns the
-OpenAI-compatible HTTP implementation, leaving the UI independent from a future
-Gateway Protocol or alternative remote Agent transport.
+`freecad/KineSketch/agent/client.py`. Its factory selects either direct HTTP or
+the system-OpenSSH tunnel while keeping the UI independent from the transport.
 
 ## Agent Tools
 

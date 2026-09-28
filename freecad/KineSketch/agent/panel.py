@@ -14,6 +14,7 @@ from PySide import QtCore, QtWidgets
 
 from .client import AgentConfig, create_agent_client
 from .session import AgentSession
+from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
 
@@ -96,6 +97,32 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         form.addRow(App.Qt.translate("KineSketch", "Agent"), self.model_edit)
         form.addRow(App.Qt.translate("KineSketch", "Access token"), self.api_key_edit)
 
+        ssh_connection = QtWidgets.QGroupBox(
+            App.Qt.translate("KineSketch", "SSH key tunnel"), container
+        )
+        ssh_connection.setCheckable(True)
+        ssh_connection.setChecked(self._settings.value("ssh/enabled", True, type=bool))
+        ssh_form = QtWidgets.QFormLayout(ssh_connection)
+        self.ssh_connection = ssh_connection
+        self.ssh_host_edit = QtWidgets.QLineEdit(
+            self._settings.value(
+                "ssh/host", os.getenv("KINESKETCH_SSH_HOST", "61.172.235.130")
+            )
+        )
+        self.ssh_port_edit = QtWidgets.QSpinBox(ssh_connection)
+        self.ssh_port_edit.setRange(1, 65535)
+        self.ssh_port_edit.setValue(
+            int(self._settings.value("ssh/port", os.getenv("KINESKETCH_SSH_PORT", "6010")))
+        )
+        self.ssh_user_edit = QtWidgets.QLineEdit(
+            self._settings.value(
+                "ssh/user", os.getenv("KINESKETCH_SSH_USER", "asus_gx10")
+            )
+        )
+        ssh_form.addRow(App.Qt.translate("KineSketch", "Server"), self.ssh_host_edit)
+        ssh_form.addRow(App.Qt.translate("KineSketch", "Port"), self.ssh_port_edit)
+        ssh_form.addRow(App.Qt.translate("KineSketch", "Username"), self.ssh_user_edit)
+
         self.transcript = QtWidgets.QTextBrowser(container)
         self.transcript.setOpenExternalLinks(True)
         self.transcript.setPlaceholderText(
@@ -123,6 +150,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         controls.addWidget(self.send_button)
 
         layout.addWidget(connection)
+        layout.addWidget(ssh_connection)
         layout.addWidget(self.transcript, 1)
         layout.addWidget(self.prompt_edit)
         layout.addLayout(controls)
@@ -143,20 +171,38 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if not endpoint or not model:
             self._append("System", "Endpoint and model are required.")
             return
+        if self.ssh_connection.isChecked() and (
+            not self.ssh_host_edit.text().strip()
+            or not self.ssh_user_edit.text().strip()
+        ):
+            self._append("System", "SSH server and username are required.")
+            return
 
         self._settings.setValue("endpoint", endpoint)
         self._settings.setValue("model", model)
+        self._settings.setValue("ssh/enabled", self.ssh_connection.isChecked())
+        self._settings.setValue("ssh/host", self.ssh_host_edit.text().strip())
+        self._settings.setValue("ssh/port", self.ssh_port_edit.value())
+        self._settings.setValue("ssh/user", self.ssh_user_edit.text().strip())
         self._session.begin(prompt, document_summary())
         self._append("You", prompt)
         self.prompt_edit.clear()
         self._request_model()
 
     def _request_model(self) -> None:
+        ssh_config = None
+        if self.ssh_connection.isChecked():
+            ssh_config = SSHConfig(
+                host=self.ssh_host_edit.text().strip(),
+                port=self.ssh_port_edit.value(),
+                username=self.ssh_user_edit.text().strip(),
+            )
         config = AgentConfig(
             endpoint=self.endpoint_edit.text().strip(),
             model=self.model_edit.text().strip(),
             api_key=self.api_key_edit.text(),
             conversation_id=self._conversation_id,
+            ssh=ssh_config,
         )
         self.send_button.setEnabled(False)
         self.send_button.setText(App.Qt.translate("KineSketch", "Working..."))
