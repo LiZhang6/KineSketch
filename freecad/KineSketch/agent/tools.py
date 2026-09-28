@@ -20,7 +20,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "create_crank",
             "description": (
                 "Create a rounded two-hole crank arm with editable dimensions and "
-                "physical mass/inertia from a sourced uniform density. "
+                "physical mass/inertia from uniform density. Missing parameters use "
+                "feasible prototype defaults, returned as explicit assumptions. "
                 "Dimensions in mm; density in kg/m^3."
             ),
             "parameters": crank_schema(),

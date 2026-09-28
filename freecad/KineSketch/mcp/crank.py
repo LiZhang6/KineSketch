@@ -24,15 +24,62 @@ def crank_schema() -> dict[str, Any]:
         "properties": {
             **{key: {"type": "number", "exclusiveMinimum": 0} for key in DIMENSIONS},
             "density": {"type": "number", "exclusiveMinimum": 0,
-                        "description": "User-supplied uniform density in kg/m^3."},
+                        "description": "Uniform density in kg/m^3; omitted uses an unverified 7850 prototype assumption."},
             "density_source": {"type": "string", "minLength": 1,
                                "description": "Measurement, datasheet or stated assumption."},
             "material": {"type": "string"},
             "label": {"type": "string"},
         },
-        "required": [*DIMENSIONS, "density", "density_source"],
+        "required": [],
         "additionalProperties": False,
     }
+
+
+def prepare_crank(arguments: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Fill missing prototype inputs without overwriting explicit constraints."""
+    resolved = dict(arguments)
+    assumptions: list[str] = []
+    allowed = {*DIMENSIONS, "density", "density_source", "material", "label"}
+    if set(resolved) - allowed:
+        raise ValueError("Unknown crank parameters")
+    for key in ("density_source", "material", "label"):
+        if key in resolved and (not isinstance(resolved[key], str)
+                                or (key == "density_source" and not resolved[key].strip())):
+            raise ValueError(f"{key} must be a non-empty string" if key == "density_source"
+                             else f"{key} must be a string")
+    for key in (*DIMENSIONS, "density"):
+        if key in resolved:
+            value = resolved[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{key} must be a positive finite number")
+
+    def fill(key: str, value: float, unit: str) -> None:
+        if key not in resolved:
+            resolved[key] = value
+            assumptions.append(f"{key}={value:.17g} {unit} (prototype default)")
+
+    largest_hole = max(resolved.get("shaft_diameter", 0), resolved.get("pin_diameter", 0))
+    fill("center_distance", max(100.0, 2 * largest_hole), "mm")
+    length = resolved["center_distance"]
+    fill("arm_width", max(0.3 * length, 1.5 * largest_hole), "mm")
+    fill("thickness", 0.08 * length, "mm")
+    for key, other, base in (("shaft_diameter", "pin_diameter", 12.0),
+                             ("pin_diameter", "shaft_diameter", 8.0)):
+        # Leave clearance around holes and between centres even for partial inputs.
+        fill(key, min(base * length / 100, 0.4 * resolved["arm_width"],
+                      0.4 * length, (2 * length - resolved.get(other, 0)) / 2), "mm")
+    if "density" not in resolved:
+        fill("density", 7850.0, "kg/m^3")
+        source = "Prototype density assumption: 7850 kg/m^3; not verified material data"
+        if resolved.get("density_source"):
+            source += f"; supplied source without a density value: {resolved['density_source']}"
+        resolved["density_source"] = source
+    elif "density_source" not in resolved:
+        resolved["density_source"] = "User-supplied density; source unspecified and unverified"
+        assumptions.append(resolved["density_source"])
+    validate_crank(resolved)
+    return resolved, assumptions
 
 
 def validate_crank(arguments: dict[str, Any]) -> None:
@@ -122,7 +169,7 @@ class CrankProxy:
 
 
 def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
-    validate_crank(arguments)
+    arguments, assumptions = prepare_crank(arguments)
     import FreeCAD as App
 
     existing = App.ActiveDocument
@@ -142,6 +189,8 @@ def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
         for name in ("Material", "DensitySource", "PhysicsAssumption", "InertiaFrame"):
             obj.addProperty("App::PropertyString", name, "Physics")
         obj.addProperty("App::PropertyVector", "CenterOfMass", "Physics")
+        obj.addProperty("App::PropertyStringList", "ModelingAssumptions", "Modeling")
+        obj.ModelingAssumptions = assumptions
         obj.Material = arguments.get("material", "Unspecified")
         obj.DensitySource = arguments["density_source"]
         obj.PhysicsAssumption = "Uniform-density rigid solid; no bearings, shaft or pin mass"
@@ -166,4 +215,5 @@ def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "name": obj.Name, "document": document.Name,
             "density_kg_m3": arguments["density"],
             "density_source": arguments["density_source"],
+            "parameters": arguments, "modeling_assumptions": assumptions,
             "assumption": obj.PhysicsAssumption, **properties}

@@ -245,8 +245,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if not prompt:
             prompt = (
                 "Inspect this image for a FreeCAD model. Identify the part and readable "
-                "dimensions; ask for missing dimensions, density and its source before "
-                "creating a crank. Do not guess physical parameters from appearance."
+                "dimensions. For a crank, create a feasible prototype using create_crank "
+                "defaults for missing parameters and report the returned assumptions. "
+                "Do not present defaults as measurements or verified material data."
             )
         if not endpoint or not model:
             self._append("System", "Endpoint and model are required.")

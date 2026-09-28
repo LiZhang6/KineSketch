@@ -126,11 +126,12 @@ images. Clear starts a new remote conversation and clears local attachments
 and history; it does not delete data already retained by the remote service.
 
 For a crank drawing, include readable dimensions and units. A photo without
-scale cannot establish precise sizes; thickness, hidden features and ambiguous
-annotations require confirmation. Density in kg/m^3 and its source must still
-be supplied explicitly before creating a physically parameterized crank.
+scale cannot establish precise sizes. Missing dimensions and density use
+explicit prototype assumptions instead of blocking creation; these are not
+measurements or verified material properties. Conflicting explicit values
+still require clarification.
 External MCP clients can likewise attach images to their vision model and pass
-the extracted, confirmed dimensions to `create_crank`.
+the extracted known dimensions to `create_crank`.
 
 The bundled `generate-3d-model` skill is loaded automatically into the agent's
 system prompt. Describe a part, for example: "Create a 60 x 40 x 8 mm mounting
@@ -168,7 +169,17 @@ run on the GUI thread.
 The embedded agent and MCP expose `create_crank` for a rounded two-hole crank
 arm. Supply the centre distance (crank radius), arm width, thickness, shaft-hole
 diameter and pin-hole diameter in mm, plus a uniform density in kg/m^3 and its
-source. Density is never inferred automatically from the material name.
+source. All inputs are optional: missing parameters use feasible prototype
+defaults. With no dimensions, the defaults are 100 mm centre distance, 30 mm
+width, 8 mm thickness, and 12/8 mm holes. Partial dimensions adjust missing
+values proportionally with hole-clearance checks; explicit inputs are never
+overwritten. Missing density uses 7850 kg/m^3 as an unverified engineering
+assumption, not a material lookup. A supplied density without a source is
+marked as unverified user input. Invalid explicit values still fail validation.
+Tool results include resolved `parameters` and `modeling_assumptions`; the
+FreeCAD object's `ModelingAssumptions` stores the initial creation assumptions,
+not a live edit history. Replace assumed dimensions and density with verified
+values before using the mass and inertia for engineering decisions.
 
 Example request: "Create a crank with centre distance 100 mm, width 30 mm,
 thickness 8 mm, shaft hole 12 mm and pin hole 8 mm. Use my supplied density of
