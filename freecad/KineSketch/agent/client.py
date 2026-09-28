@@ -48,6 +48,7 @@ class AgentClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
+        tool_choice: str = "auto",
     ) -> dict[str, Any]: ...
 
 
@@ -66,6 +67,7 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
+        tool_choice: str = "auto",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -76,7 +78,7 @@ class OpenAICompatibleClient:
             payload["user"] = self.config.conversation_id
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice
         if on_content is not None:
             payload["stream"] = True
 
@@ -131,6 +133,7 @@ class SSHTunneledAgentClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
+        tool_choice: str = "auto",
     ) -> dict[str, Any]:
         parsed = _parse_tunnel_endpoint(self.config.endpoint)
         remote_port = parsed.port or 80
@@ -140,7 +143,10 @@ class SSHTunneledAgentClient:
             )
             direct_config = replace(self.config, endpoint=local_endpoint, ssh=None)
             return OpenAICompatibleClient(direct_config).complete(
-                messages, tools, on_content=on_content
+                messages,
+                tools,
+                on_content=on_content,
+                tool_choice=tool_choice,
             )
 
 
