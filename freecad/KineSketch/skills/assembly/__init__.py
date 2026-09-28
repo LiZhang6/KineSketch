@@ -1,0 +1,1 @@
+"""Slider-crank assembly skill."""
