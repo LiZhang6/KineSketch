@@ -19,6 +19,7 @@ from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
 
 class _RequestWorker(QtCore.QObject):
+    content_delta = QtCore.Signal(str)
     completed = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
@@ -31,7 +32,9 @@ class _RequestWorker(QtCore.QObject):
     def run(self) -> None:
         try:
             reply = create_agent_client(self._config).complete(
-                self._messages, TOOL_DEFINITIONS
+                self._messages,
+                TOOL_DEFINITIONS,
+                on_content=self.content_delta.emit,
             )
         except Exception as error:
             self.failed.emit(str(error))
@@ -54,6 +57,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._thread: QtCore.QThread | None = None
         self._worker: _RequestWorker | None = None
         self._continue_after_finish = False
+        self._streaming_reply_started = False
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
         self._build_ui()
@@ -239,11 +243,13 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             "busy",
             busy=True,
         )
+        self._streaming_reply_started = False
 
         thread = QtCore.QThread(self)
         worker = _RequestWorker(config, self._session.request_messages)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.content_delta.connect(self._handle_content_delta)
         worker.completed.connect(self._handle_reply)
         worker.failed.connect(self._handle_error)
         worker.completed.connect(thread.quit)
@@ -260,6 +266,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         try:
             tool_calls = self._session.accept_assistant(message)
             if tool_calls:
+                self._append_unstreamed_content(message)
                 self._set_status(
                     App.Qt.translate("KineSketch", "Applying agent actions..."),
                     "warning",
@@ -271,8 +278,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 self._session.continue_after_tools()
                 self._continue_after_finish = True
                 return
-            content = message.get("content") or ""
-            self._append("KineSketch", str(content))
+            self._append_unstreamed_content(message)
             self._set_status(
                 App.Qt.translate("KineSketch", "Response received"), "ready"
             )
@@ -281,6 +287,20 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._set_status(
                 App.Qt.translate("KineSketch", "Agent action failed"), "error"
             )
+
+    @QtCore.Slot(str)
+    def _handle_content_delta(self, content: str) -> None:
+        if not content:
+            return
+        if not self._streaming_reply_started:
+            self._begin_stream("KineSketch")
+            self._streaming_reply_started = True
+        self._append_stream_text(content)
+        self._set_status(
+            App.Qt.translate("KineSketch", "Receiving response..."),
+            "busy",
+            busy=True,
+        )
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
@@ -353,6 +373,26 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if not self.transcript.document().isEmpty():
             cursor.insertText("\n\n")
         cursor.insertText(f"{speaker}\n{text}")
+        self.transcript.setTextCursor(cursor)
+        self.transcript.ensureCursorVisible()
+
+    def _append_unstreamed_content(self, message: dict[str, Any]) -> None:
+        content = message.get("content") or ""
+        if content and not self._streaming_reply_started:
+            self._append("KineSketch", str(content))
+
+    def _begin_stream(self, speaker: str) -> None:
+        cursor = self.transcript.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        if not self.transcript.document().isEmpty():
+            cursor.insertText("\n\n")
+        cursor.insertText(f"{speaker}\n")
+        self.transcript.setTextCursor(cursor)
+
+    def _append_stream_text(self, text: str) -> None:
+        cursor = self.transcript.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
         self.transcript.setTextCursor(cursor)
         self.transcript.ensureCursorVisible()
 

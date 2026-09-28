@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -16,6 +16,9 @@ from .ssh_tunnel import SSHConfig, SSHTunnel
 
 class AgentClientError(RuntimeError):
     """Raised when the configured model endpoint cannot return a valid reply."""
+
+
+ContentCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,7 @@ class AgentClient(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        on_content: ContentCallback | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -61,6 +65,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        on_content: ContentCallback | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -72,8 +77,11 @@ class OpenAICompatibleClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if on_content is not None:
+            payload["stream"] = True
 
         headers = {
+            "Accept": "text/event-stream" if on_content is not None else "application/json",
             "Content-Type": "application/json",
             "User-Agent": "KineSketch-FreeCAD-Agent/1.0",
         }
@@ -88,6 +96,8 @@ class OpenAICompatibleClient:
         )
         try:
             with urlopen(request, timeout=self.config.timeout) as response:
+                if on_content is not None:
+                    return _read_streaming_message(response, on_content)
                 result = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
@@ -120,6 +130,7 @@ class SSHTunneledAgentClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        on_content: ContentCallback | None = None,
     ) -> dict[str, Any]:
         parsed = _parse_tunnel_endpoint(self.config.endpoint)
         remote_port = parsed.port or 80
@@ -128,7 +139,103 @@ class SSHTunneledAgentClient:
                 parsed._replace(netloc=f"127.0.0.1:{tunnel.local_port}")
             )
             direct_config = replace(self.config, endpoint=local_endpoint, ssh=None)
-            return OpenAICompatibleClient(direct_config).complete(messages, tools)
+            return OpenAICompatibleClient(direct_config).complete(
+                messages, tools, on_content=on_content
+            )
+
+
+def _read_streaming_message(response: Any, on_content: ContentCallback) -> dict[str, Any]:
+    content_parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    received_done = False
+
+    try:
+        for raw_line in response:
+            line = raw_line.decode("utf-8").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[5:].lstrip()
+            if data == "[DONE]":
+                received_done = True
+                break
+            event = json.loads(data)
+            if not isinstance(event, dict):
+                raise AgentClientError("Model endpoint returned an invalid stream event")
+            if "error" in event:
+                raise AgentClientError(_stream_error_message(event["error"]))
+
+            choices = event.get("choices")
+            if not choices:
+                continue
+            if not isinstance(choices, list) or not isinstance(choices[0], dict):
+                raise AgentClientError("Model endpoint returned invalid stream choices")
+            delta = choices[0].get("delta", {})
+            if not isinstance(delta, dict):
+                raise AgentClientError("Model endpoint returned an invalid stream delta")
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+                on_content(content)
+            call_deltas = delta.get("tool_calls") or []
+            if not isinstance(call_deltas, list):
+                raise AgentClientError("Model endpoint returned invalid tool-call deltas")
+            for call_delta in call_deltas:
+                _merge_tool_call_delta(tool_calls, call_delta)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AgentClientError("Model endpoint returned an invalid SSE stream") from error
+
+    if not received_done:
+        raise AgentClientError("Model endpoint ended the stream before [DONE]")
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return message
+
+
+def _merge_tool_call_delta(
+    tool_calls: dict[int, dict[str, Any]], call_delta: Any
+) -> None:
+    if not isinstance(call_delta, dict):
+        raise AgentClientError("Model endpoint returned an invalid tool-call delta")
+    index = call_delta.get("index")
+    if not isinstance(index, int) or index < 0:
+        raise AgentClientError("Model endpoint returned a tool call without an index")
+
+    call = tool_calls.setdefault(
+        index,
+        {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        },
+    )
+    if isinstance(call_delta.get("id"), str):
+        call["id"] = call_delta["id"]
+    if isinstance(call_delta.get("type"), str):
+        call["type"] = call_delta["type"]
+
+    function_delta = call_delta.get("function")
+    if function_delta is None:
+        return
+    if not isinstance(function_delta, dict):
+        raise AgentClientError("Model endpoint returned an invalid tool function")
+    for field in ("name", "arguments"):
+        value = function_delta.get(field)
+        if isinstance(value, str):
+            call["function"][field] += value
+
+
+def _stream_error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        detail = error.get("message") or error.get("code") or str(error)
+    else:
+        detail = str(error)
+    return f"Model endpoint returned a streaming error: {detail}"
 
 
 def _parse_tunnel_endpoint(endpoint: str) -> SplitResult:
