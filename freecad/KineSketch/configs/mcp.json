@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kinesketch": {
+      "command": "python",
+      "args": ["-m", "freecad.KineSketch.mcp.server"]
+    }
+  }
+}

@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+"""Parametric crank arm with mass properties derived from a uniform solid."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+DIMENSIONS = {
+    "center_distance": "CrankRadius",
+    "arm_width": "ArmWidth",
+    "thickness": "Thickness",
+    "shaft_diameter": "ShaftDiameter",
+    "pin_diameter": "PinDiameter",
+}
+INERTIA_FIELDS = {"Ixx": "A11", "Iyy": "A22", "Izz": "A33",
+                  "Ixy": "A12", "Ixz": "A13", "Iyz": "A23"}
+
+
+def crank_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            **{key: {"type": "number", "exclusiveMinimum": 0} for key in DIMENSIONS},
+            "density": {"type": "number", "exclusiveMinimum": 0,
+                        "description": "User-supplied uniform density in kg/m^3."},
+            "density_source": {"type": "string", "minLength": 1,
+                               "description": "Measurement, datasheet or stated assumption."},
+            "material": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": [*DIMENSIONS, "density", "density_source"],
+        "additionalProperties": False,
+    }
+
+
+def validate_crank(arguments: dict[str, Any]) -> None:
+    allowed = {*DIMENSIONS, "density", "density_source", "material", "label"}
+    if set(arguments) - allowed:
+        raise ValueError("Unknown crank parameters")
+    for key in [*DIMENSIONS, "density"]:
+        value = arguments.get(key)
+        if isinstance(value, bool) or not isinstance(value, (float, int)):
+            raise ValueError(f"{key} must be a positive finite number")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be a positive finite number")
+    for key in ("density_source", "material", "label"):
+        if key in arguments and not isinstance(arguments[key], str):
+            raise ValueError(f"{key} must be a string")
+    if not arguments.get("density_source", "").strip():
+        raise ValueError("Density source is required; do not infer density from appearance")
+    diameter_max = max(arguments["shaft_diameter"], arguments["pin_diameter"])
+    if diameter_max >= arguments["arm_width"]:
+        raise ValueError("Hole diameters must be smaller than arm width")
+    hole_radii_sum = (arguments["shaft_diameter"] + arguments["pin_diameter"]) / 2
+    if hole_radii_sum >= arguments["center_distance"]:
+        raise ValueError("Shaft and pin holes must not overlap or touch")
+
+
+def mass_properties(shape: Any, density: float) -> dict[str, Any]:
+    """Convert OCC volume integrals in mm to mass and centroidal inertia in SI."""
+    volume = float(shape.Volume) * 1e-9
+    mass = density * volume
+    centre = shape.CenterOfMass
+    inertia = {key: float(getattr(shape.MatrixOfInertia, field)) * density * 1e-15
+               for key, field in INERTIA_FIELDS.items()}
+    # Parallel-axis theorem about the shaft's local Z axis through x=y=0.
+    shaft_inertia = inertia["Izz"] + mass * ((centre.x * 1e-3) ** 2 + (centre.y * 1e-3) ** 2)
+    return {
+        "volume_m3": volume,
+        "mass_kg": mass,
+        "center_of_mass_mm": [centre.x, centre.y, centre.z],
+        "inertia_kg_m2": inertia,
+        "shaft_inertia_kg_m2": shaft_inertia,
+        "frame": "Body-local XYZ; tensor about centre of mass; shaft along local Z",
+    }
+
+
+class CrankProxy:
+    """Rebuild geometry and physical properties whenever input properties change."""
+
+    def execute(self, obj) -> None:
+        import FreeCAD as App
+        import Part
+
+        self.error = ""
+        try:
+            arguments = {key: float(getattr(obj, prop).Value) for key, prop in DIMENSIONS.items()}
+            arguments["density"] = float(obj.Density.getValueAs("kg/m^3").Value)
+            arguments["density_source"] = obj.DensitySource
+            validate_crank(arguments)
+            length, width, height = (arguments[key] for key in
+                                     ("center_distance", "arm_width", "thickness"))
+            body = Part.makeBox(length, width, height, App.Vector(0, -width / 2, 0))
+            for x in (0, length):
+                body = body.fuse(Part.makeCylinder(width / 2, height, App.Vector(x, 0, 0)))
+            margin = max(1.0, height * 0.01)
+            for x, diameter in ((0, arguments["shaft_diameter"]),
+                                (length, arguments["pin_diameter"])):
+                body = body.cut(Part.makeCylinder(diameter / 2, height + 2 * margin,
+                                                 App.Vector(x, 0, -margin)))
+            body = body.removeSplitter()
+            if body.isNull() or not body.isValid() or len(body.Solids) != 1 or body.Volume <= 0:
+                raise ValueError("Crank must be one valid solid")
+            properties = mass_properties(body, arguments["density"])
+            obj.Shape = body
+            obj.Mass = f"{properties['mass_kg']:.17g} kg"
+            obj.CenterOfMass = body.CenterOfMass
+            for key, value in properties["inertia_kg_m2"].items():
+                setattr(obj, key, f"{value:.17g} kg*m^2")
+            obj.ShaftInertia = f"{properties['shaft_inertia_kg_m2']:.17g} kg*m^2"
+        except Exception as error:
+            self.error = str(error)
+            raise
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        self.error = ""
+
+
+def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
+    validate_crank(arguments)
+    import FreeCAD as App
+
+    existing = App.ActiveDocument
+    document = existing or App.newDocument("KineSketch")
+    document.openTransaction("KineSketch: Create physical crank")
+    try:
+        obj = document.addObject("Part::FeaturePython", "Crank")
+        obj.Label = arguments.get("label", "Crank")
+        for key, name in DIMENSIONS.items():
+            obj.addProperty("App::PropertyLength", name, "Crank geometry")
+            setattr(obj, name, float(arguments[key]))
+        obj.addProperty("App::PropertyDensity", "Density", "Physics")
+        obj.addProperty("App::PropertyMass", "Mass", "Physics")
+        for name in (*INERTIA_FIELDS, "ShaftInertia"):
+            obj.addProperty("App::PropertyQuantity", name, "Physics")
+            setattr(obj, name, App.Units.Unit("kg*m^2"))
+        for name in ("Material", "DensitySource", "PhysicsAssumption", "InertiaFrame"):
+            obj.addProperty("App::PropertyString", name, "Physics")
+        obj.addProperty("App::PropertyVector", "CenterOfMass", "Physics")
+        obj.Material = arguments.get("material", "Unspecified")
+        obj.DensitySource = arguments["density_source"]
+        obj.PhysicsAssumption = "Uniform-density rigid solid; no bearings, shaft or pin mass"
+        obj.InertiaFrame = "Body-local XYZ, centre of mass; shaft is local Z at x=y=0"
+        obj.Density = f"{arguments['density']:.17g} kg/m^3"
+        obj.Proxy = CrankProxy()
+        if App.GuiUp:
+            obj.ViewObject.Proxy = 0
+        document.recompute()
+        if getattr(obj.Proxy, "error", "") or obj.Shape.isNull():
+            raise ValueError(getattr(obj.Proxy, "error", "") or "Crank recompute failed")
+        for name in ("Mass", "CenterOfMass", *INERTIA_FIELDS, "ShaftInertia",
+                     "PhysicsAssumption", "InertiaFrame"):
+            obj.setEditorMode(name, 1)
+        properties = mass_properties(obj.Shape, arguments["density"])
+        document.commitTransaction()
+    except Exception:
+        document.abortTransaction()
+        if existing is None:
+            App.closeDocument(document.Name)
+        raise
+    return {"ok": True, "name": obj.Name, "document": document.Name,
+            "density_kg_m3": arguments["density"],
+            "density_source": arguments["density_source"],
+            "assumption": obj.PhysicsAssumption, **properties}

@@ -110,6 +110,43 @@ the system-OpenSSH tunnel while keeping the UI independent from the transport.
 
 ## Agent Tools
 
+### Image Input
+
+Use **Attach image** in the agent panel to select one PNG, JPEG or WebP file
+(up to 10 MiB), optionally add text, then press **Send**. The filename appears
+beside the attachment button; **Remove image** discards it before sending.
+Images are sent as base64 `image_url` content alongside the text to your
+configured remote endpoint, including through the SSH tunnel. Only attach
+images you intend to upload. Attachment data is not saved to Qt settings.
+
+The remote agent and its underlying model must support vision and accept
+multimodal Chat Completions messages with data URLs. KineSketch does not add
+a local vision model or silently retry as text-only if the backend rejects
+images. Clear starts a new remote conversation and clears local attachments
+and history; it does not delete data already retained by the remote service.
+
+For a crank drawing, include readable dimensions and units. A photo without
+scale cannot establish precise sizes; thickness, hidden features and ambiguous
+annotations require confirmation. Density in kg/m^3 and its source must still
+be supplied explicitly before creating a physically parameterized crank.
+External MCP clients can likewise attach images to their vision model and pass
+the extracted, confirmed dimensions to `create_crank`.
+
+The bundled `generate-3d-model` skill is loaded automatically into the agent's
+system prompt. Describe a part, for example: "Create a 60 x 40 x 8 mm mounting
+plate with a centred 10 mm through-hole." The agent translates the description
+into a structured `generate_model` plan and creates an editable parametric tree.
+Plans support boxes, cylinders, spheres, unions and cuts, including primitive
+position and rotation. Every plan is one transaction; invalid geometry rolls
+back all of its operations. Sketches, fillets and lofts are not supported yet.
+
+Generated models use native FreeCAD Part objects. The default saved format is
+`.FCStd`, retaining editable dimensions, placements and boolean dependencies.
+For example, ask: "Create the mounting plate and save it as
+E:/models/mounting_plate.FCStd." The output directory must already exist.
+`save_model` automatically appends `.FCStd` when a path has no extension.
+STEP and STL are explicit exports and do not preserve FreeCAD parametric history.
+
 The initial agent can:
 
 - inspect active document objects and the current selection;
@@ -123,6 +160,67 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
+
+## Modeling Skill and MCP
+
+### Cranks and Physical Parameters
+
+The embedded agent and MCP expose `create_crank` for a rounded two-hole crank
+arm. Supply the centre distance (crank radius), arm width, thickness, shaft-hole
+diameter and pin-hole diameter in mm, plus a uniform density in kg/m^3 and its
+source. Density is never inferred automatically from the material name.
+
+Example request: "Create a crank with centre distance 100 mm, width 30 mm,
+thickness 8 mm, shaft hole 12 mm and pin hole 8 mm. Use my supplied density of
+7850 kg/m^3; record its source as my stated engineering assumption. Save it as
+E:/models/crank.FCStd." This is an example assumption, not certified material data.
+
+The native `Part::FeaturePython` stores editable geometry and density, computed
+mass, local centre of mass, centroidal inertia tensor and shaft-axis inertia.
+Computed values carry units and are read-only in the property editor. Editing
+dimensions or density and recomputing updates both shape and physics. Keep
+KineSketch installed when reopening the file so FreeCAD can restore its proxy.
+
+The model assumes a uniform rigid solid; shaft, pin and bearing masses are not
+included. The shaft is the local Z axis through (0, 0), with the pin centre on
+positive X. This provides physical parameters for future dynamics integration;
+it does not yet simulate crank motion, stresses or bearing friction. Inertia uses
+FreeCAD/OCC volume integrals about the centre of mass and the parallel-axis
+theorem for the shaft ([OCC mass-properties reference](https://occt3d.com/dev/doc/refman/html/class_g_prop___g_props.html)).
+
+The skill lives in `freecad/KineSketch/skills/generate-3d-model/SKILL.md`.
+Its `agents/openai.yaml` binds it to the `kinesketch` stdio MCP server. The server
+exposes the same tool schemas and handlers as the embedded agent, including
+`save_model` for FCStd, STEP and STL files. It also exposes the skill as the
+`generate-3d-model` MCP prompt. The LLM interprets natural language; the MCP tools
+execute validated modeling plans, not arbitrary Python.
+
+The MCP server runs in a separate process with its own FreeCAD document. It does
+not control an already-open FreeCAD GUI. Ask the MCP client to save the result
+with `save_model` and open that file in FreeCAD. Existing output files are not
+overwritten. The remote SSH Agent Gateway does not need the MCP SDK; the MCP
+server belongs on the machine where FreeCAD performs the modeling.
+
+Use a Python environment compatible with the installed FreeCAD build, where
+`import FreeCAD` and `import Part` both succeed. Install this project and the
+optional MCP dependency in that environment:
+
+```bash
+python -c "import FreeCAD, Part"
+python -m pip install -e ".[mcp]"
+python -m freecad.KineSketch.mcp.server
+```
+
+`freecad/KineSketch/configs/mcp.json` is a client configuration example. Set its
+`command` to the absolute path of that Python executable before adding the
+`kinesketch` entry to your MCP client's configuration. Install or copy the skill
+directory into that client's skill discovery directory. Binding metadata alone
+does not install or register an MCP server in an external client.
+
+The embedded panel uses the same modeling functions directly, so it needs no
+MCP SDK installation. The standalone server uses the
+[official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk/tree/v1.x),
+installed through the optional extra above.
 
 ## Build
 

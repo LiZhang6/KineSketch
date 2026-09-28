@@ -6,13 +6,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..skills import modeling_instructions
+from .images import ImageAttachment
+
 
 SYSTEM_PROMPT = """You are KineSketch, an assistant embedded in FreeCAD.
 Help the user inspect and modify the active CAD document. Use the provided tools when
 the user asks for a concrete document change. Never claim that a change happened
 unless its tool returned success. Prefer simple parametric primitives and concise
 answers. Dimensions and coordinates are in millimetres; angles are in degrees.
-Do not emit Python code for execution."""
+Do not emit Python code for execution.""" + "\n\n" + modeling_instructions()
 
 
 class AgentSession:
@@ -34,12 +37,23 @@ class AgentSession:
     def request_messages(self) -> list[dict[str, Any]]:
         return [self._messages[0], *self._messages[self._turn_start :]]
 
-    def begin(self, user_text: str, document_context: str) -> None:
+    def begin(
+        self, user_text: str, document_context: str,
+        image: ImageAttachment | None = None,
+    ) -> None:
         self._tool_rounds = 0
         self._trim_history()
         self._turn_start = len(self._messages)
         content = f"Current FreeCAD document:\n{document_context}\n\nUser request:\n{user_text}"
-        self._messages.append({"role": "user", "content": content})
+        if image is None:
+            self._messages.append({"role": "user", "content": content})
+        else:
+            self._messages.append({"role": "user", "content": [
+                {"type": "text", "text": content},
+                {"type": "image_url", "image_url": {
+                    "url": image.data_url, "detail": "high",
+                }},
+            ]})
 
     def accept_assistant(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         stored: dict[str, Any] = {

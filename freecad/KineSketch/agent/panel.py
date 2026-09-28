@@ -13,6 +13,7 @@ import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
 from .client import AgentConfig, create_agent_client
+from .images import ImageAttachment, load_image
 from .session import AgentSession
 from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
@@ -54,6 +55,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
         )
         self._session = AgentSession()
+        self._image: ImageAttachment | None = None
         self._thread: QtCore.QThread | None = None
         self._worker: _RequestWorker | None = None
         self._continue_after_finish = False
@@ -158,6 +160,22 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.status_progress.setFixedHeight(4)
 
         controls = QtWidgets.QHBoxLayout()
+        self.image_button = QtWidgets.QToolButton(container)
+        self.image_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+        self.image_button.setToolTip(App.Qt.translate("KineSketch", "Attach image"))
+        self.image_label = QtWidgets.QLabel(container)
+        self.image_label.setTextFormat(QtCore.Qt.PlainText)
+        self.image_label.setWordWrap(True)
+        self.remove_image_button = QtWidgets.QToolButton(container)
+        self.remove_image_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogCancelButton)
+        )
+        self.remove_image_button.setToolTip(App.Qt.translate("KineSketch", "Remove image"))
+        self.remove_image_button.setVisible(False)
+        attachments = QtWidgets.QHBoxLayout()
+        attachments.addWidget(self.image_button)
+        attachments.addWidget(self.image_label, 1)
+        attachments.addWidget(self.remove_image_button)
         self.clear_button = QtWidgets.QPushButton(
             App.Qt.translate("KineSketch", "Clear"), container
         )
@@ -175,12 +193,42 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         layout.addLayout(status_layout)
         layout.addWidget(self.status_progress)
         layout.addWidget(self.prompt_edit)
+        layout.addLayout(attachments)
         layout.addLayout(controls)
         self.setWidget(container)
 
         self.send_button.clicked.connect(self._send)
         self.clear_button.clicked.connect(self._clear)
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
+        self.image_button.clicked.connect(self._attach_image)
+        self.remove_image_button.clicked.connect(self._remove_image)
+
+    @QtCore.Slot()
+    def _attach_image(self) -> None:
+        if self._thread is not None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, App.Qt.translate("KineSketch", "Attach image"), "",
+            "Images (*.png *.jpg *.jpeg *.webp)",
+        )
+        if not path:
+            return
+        try:
+            image = load_image(path)
+        except (OSError, ValueError) as error:
+            self._append("System", str(error))
+            return
+        self._image = image
+        self.image_label.setText(image.filename)
+        self.remove_image_button.setVisible(True)
+
+    @QtCore.Slot()
+    def _remove_image(self) -> None:
+        if self._thread is not None:
+            return
+        self._image = None
+        self.image_label.clear()
+        self.remove_image_button.setVisible(False)
 
     @QtCore.Slot()
     def _send(self) -> None:
@@ -189,11 +237,17 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         prompt = self.prompt_edit.toPlainText().strip()
         endpoint = self.endpoint_edit.text().strip()
         model = self.model_edit.text().strip()
-        if not prompt:
+        if not prompt and self._image is None:
             self._set_status(
                 App.Qt.translate("KineSketch", "Enter a message"), "warning"
             )
             return
+        if not prompt:
+            prompt = (
+                "Inspect this image for a FreeCAD model. Identify the part and readable "
+                "dimensions; ask for missing dimensions, density and its source before "
+                "creating a crank. Do not guess physical parameters from appearance."
+            )
         if not endpoint or not model:
             self._append("System", "Endpoint and model are required.")
             self._set_status(
@@ -217,8 +271,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._settings.setValue("ssh/host", self.ssh_host_edit.text().strip())
         self._settings.setValue("ssh/port", self.ssh_port_edit.value())
         self._settings.setValue("ssh/user", self.ssh_user_edit.text().strip())
-        self._session.begin(prompt, document_summary())
+        self._session.begin(prompt, document_summary(), self._image)
         self._append("You", prompt)
+        if self._image is not None:
+            self._append("Image", self._image.filename)
+        self._remove_image()
         self.prompt_edit.clear()
         self._request_model()
 
@@ -324,6 +381,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._thread is not None:
             return
         self._session.clear()
+        self._remove_image()
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
@@ -336,6 +394,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.model_connection.setEnabled(not busy)
         self.ssh_connection.setEnabled(not busy)
         self.prompt_edit.setEnabled(not busy)
+        self.image_button.setEnabled(not busy)
+        self.remove_image_button.setEnabled(not busy)
         self.clear_button.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
         self.send_button.setText(

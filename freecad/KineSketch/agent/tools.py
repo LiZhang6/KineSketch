@@ -9,8 +9,56 @@ from typing import Any, Callable
 
 import FreeCAD as App
 
+from ..mcp.modeling import generate_model, plan_schema, save_model
+from ..mcp.crank import crank_schema, create_crank
+
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_crank",
+            "description": (
+                "Create a rounded two-hole crank arm with editable dimensions and "
+                "physical mass/inertia from a sourced uniform density. "
+                "Dimensions in mm; density in kg/m^3."
+            ),
+            "parameters": crank_schema(),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_model",
+            "description": (
+                "Save an editable FreeCAD document to a new absolute FCStd path. "
+                "Paths without an extension default to .FCStd. "
+                "Use STEP or STL only when the user explicitly requests an export."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_model",
+            "description": "Build a parametric model plan atomically, with primitives and booleans.",
+            "parameters": plan_schema(),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_document",
+            "description": "Inspect the current FreeCAD document and selection.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -114,6 +162,10 @@ def execute_tool_call(tool_call: dict[str, Any]) -> str:
         return json.dumps({"ok": False, "error": "Tool arguments must be an object"})
 
     handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+        "create_crank": create_crank,
+        "save_model": lambda arguments: save_model(arguments["path"]),
+        "generate_model": generate_model,
+        "inspect_document": lambda _: {"ok": True, "summary": document_summary()},
         "create_box": _create_box,
         "create_cylinder": _create_cylinder,
         "set_placement": _set_placement,

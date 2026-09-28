@@ -1,0 +1,10 @@
+interface:
+  display_name: "FreeCAD 3D Modeling"
+  short_description: "Create parametric 3D parts from natural language"
+  default_prompt: "Use $generate-3d-model to create a FreeCAD part from my description."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "kinesketch"
+      description: "FreeCAD modeling tools provided by KineSketch"
+      transport: "stdio"
