@@ -5,6 +5,11 @@
 from __future__ import annotations
 
 import json
+import socket
+import io
+import time
+from contextlib import contextmanager
+from http.client import HTTPConnection, HTTPSConnection, HTTPException, HTTPResponse
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
@@ -12,6 +17,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .ssh_tunnel import SSHConfig, SSHTunnel
+from .cancellation import RequestCancellation
 
 
 class AgentClientError(RuntimeError):
@@ -49,6 +55,7 @@ class AgentClient(Protocol):
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
         tool_choice: str = "auto",
+        cancellation: RequestCancellation | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -68,7 +75,10 @@ class OpenAICompatibleClient:
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
         tool_choice: str = "auto",
+        cancellation: RequestCancellation | None = None,
     ) -> dict[str, Any]:
+        if cancellation is not None:
+            cancellation.check()
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -97,16 +107,20 @@ class OpenAICompatibleClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.config.timeout) as response:
+            with _open_response(request, self.config.timeout, cancellation) as response:
                 if on_content is not None:
-                    return _read_streaming_message(response, on_content)
+                    return _read_streaming_message(response, on_content, cancellation)
                 result = json.loads(response.read().decode("utf-8"))
+                if cancellation is not None:
+                    cancellation.check()
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             raise AgentClientError(
                 f"Model endpoint returned HTTP {error.code}: {detail}"
             ) from error
-        except (URLError, TimeoutError) as error:
+        except (URLError, OSError, HTTPException) as error:
+            if cancellation is not None:
+                cancellation.check()
             raise AgentClientError(f"Cannot reach model endpoint: {error}") from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise AgentClientError("Model endpoint returned invalid JSON") from error
@@ -134,10 +148,12 @@ class SSHTunneledAgentClient:
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
         tool_choice: str = "auto",
+        cancellation: RequestCancellation | None = None,
     ) -> dict[str, Any]:
         parsed = _parse_tunnel_endpoint(self.config.endpoint)
         remote_port = parsed.port or 80
-        with SSHTunnel(self.config.ssh, parsed.hostname or "", remote_port) as tunnel:
+        options = {"cancellation": cancellation} if cancellation is not None else {}
+        with SSHTunnel(self.config.ssh, parsed.hostname or "", remote_port, **options) as tunnel:
             local_endpoint = urlunsplit(
                 parsed._replace(netloc=f"127.0.0.1:{tunnel.local_port}")
             )
@@ -147,16 +163,107 @@ class SSHTunneledAgentClient:
                 tools,
                 on_content=on_content,
                 tool_choice=tool_choice,
+                **options,
             )
 
 
-def _read_streaming_message(response: Any, on_content: ContentCallback) -> dict[str, Any]:
+@contextmanager
+def _open_response(request: Request, timeout: float, cancellation: RequestCancellation | None):
+    if cancellation is None:
+        with urlopen(request, timeout=timeout) as response:
+            yield response
+        return
+    parsed = urlsplit(request.full_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Agent endpoint must be an absolute HTTP or HTTPS URL")
+    connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
+    connection.response_class = lambda sock, **kwargs: HTTPResponse(
+        _ResponseSocket(sock, cancellation, timeout), **kwargs)
+    try:
+        cancellation.check()
+        connection.connect()
+        transport = connection.sock
+        # Interrupt the socket immediately; response cleanup stays on the worker.
+        def interrupt():
+            try:
+                transport.shutdown(socket.SHUT_RDWR)
+            finally:
+                transport.close()
+
+        with cancellation.bind(interrupt):
+            path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            connection.request(request.get_method(), path, body=request.data,
+                               headers=dict(request.header_items()))
+            with connection.getresponse() as response:
+                cancellation.check()
+                if response.status >= 400:
+                    detail = response.read().decode("utf-8", errors="replace")
+                    cancellation.check()
+                    raise AgentClientError(f"Model endpoint returned HTTP {response.status}: {detail}")
+                yield response
+    finally:
+        connection.close()
+
+
+class _ResponseSocket:
+    def __init__(self, transport, cancellation, timeout):
+        self.transport = transport
+        self.cancellation = cancellation
+        self.timeout = timeout
+
+    def makefile(self, mode):
+        return io.BufferedReader(_ResponseReader(self.transport, self.cancellation, self.timeout))
+
+
+class _ResponseReader(io.RawIOBase):
+    """Poll cancellation without losing partially buffered HTTP/SSE lines."""
+
+    def __init__(self, transport, cancellation, timeout):
+        super().__init__()
+        self.transport = transport
+        self.cancellation = cancellation
+        self.timeout = timeout
+        self._owner = None
+        cancellation.check()
+        transport.settimeout(min(0.2, timeout))
+        # Retain the socket while HTTPConnection releases a Connection: close response.
+        self._owner = transport.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def close(self):
+        try:
+            if self._owner is not None:
+                self._owner.close()
+        finally:
+            super().close()
+
+    def readinto(self, buffer):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            self.cancellation.check()
+            try:
+                count = self.transport.recv_into(buffer)
+                self.cancellation.check()
+                return count
+            except TimeoutError:
+                self.cancellation.check()
+                if time.monotonic() >= deadline:
+                    raise
+
+
+def _read_streaming_message(response: Any, on_content: ContentCallback,
+                            cancellation: RequestCancellation | None = None) -> dict[str, Any]:
     content_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     received_done = False
 
     try:
         for raw_line in response:
+            if cancellation is not None:
+                cancellation.check()
             line = raw_line.decode("utf-8").strip()
             if not line or line.startswith(":") or not line.startswith("data:"):
                 continue
@@ -191,6 +298,8 @@ def _read_streaming_message(response: Any, on_content: ContentCallback) -> dict[
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AgentClientError("Model endpoint returned an invalid SSE stream") from error
 
+    if cancellation is not None:
+        cancellation.check()
     if not received_done:
         raise AgentClientError("Model endpoint ended the stream before [DONE]")
 

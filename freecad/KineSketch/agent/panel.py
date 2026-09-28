@@ -16,6 +16,7 @@ import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
 from .client import AgentConfig, create_agent_client
+from .cancellation import RequestCancellation, RequestCancelled
 from .defaults import connection_defaults
 from .images import ImageAttachment, load_image
 from .session import AgentSession
@@ -24,24 +25,29 @@ from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
 
 class _RequestWorker(QtCore.QObject):
-    content_delta = QtCore.Signal(str)
-    completed = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
+    content_delta = QtCore.Signal(int, str)
+    completed = QtCore.Signal(int, object)
+    failed = QtCore.Signal(int, str)
+    finished = QtCore.Signal()
 
     def __init__(
         self, config: AgentConfig, messages: list[dict[str, Any]],
         tools: list[dict[str, Any]], tool_choice: str,
+        request_id: int = 0,
     ) -> None:
         super().__init__()
         self._config = config
         self._messages = messages
         self._tools = tools
         self._tool_choice = tool_choice
+        self.request_id = request_id
+        self.cancellation = RequestCancellation()
         self._stream_parts: list[str] = []
         self._stream_size = 0
         self._last_stream_emit = time.monotonic()
 
     def _buffer_content(self, content: str) -> None:
+        self.cancellation.check()
         self._stream_parts.append(content)
         self._stream_size += len(content)
         if self._stream_size >= 4096 or time.monotonic() - self._last_stream_emit >= 0.075:
@@ -49,7 +55,7 @@ class _RequestWorker(QtCore.QObject):
 
     def _flush_content(self) -> None:
         if self._stream_parts:
-            self.content_delta.emit("".join(self._stream_parts))
+            self.content_delta.emit(self.request_id, "".join(self._stream_parts))
             self._stream_parts.clear()
             self._stream_size = 0
             self._last_stream_emit = time.monotonic()
@@ -57,18 +63,30 @@ class _RequestWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self) -> None:
         try:
+            self.cancellation.check()
             reply = create_agent_client(self._config).complete(
                 self._messages,
                 self._tools,
                 on_content=self._buffer_content,
                 tool_choice=self._tool_choice,
+                cancellation=self.cancellation,
             )
-        except Exception as error:
-            self._flush_content()
-            self.failed.emit(str(error))
+            self.cancellation.check()
+        except RequestCancelled:
             return
-        self._flush_content()
-        self.completed.emit(reply)
+        except Exception as error:
+            if not self.cancellation.cancelled:
+                self._flush_content()
+                self.failed.emit(self.request_id, str(error))
+            return
+        else:
+            self._flush_content()
+            self.completed.emit(self.request_id, reply)
+        finally:
+            self.finished.emit()
+
+    def cancel(self) -> None:
+        self.cancellation.cancel()
 
 
 class AgentDockWidget(QtWidgets.QDockWidget):
@@ -88,9 +106,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._worker: _RequestWorker | None = None
         self._continue_after_finish = False
         self._busy = False
-        self._paused = False
-        self._paused_reply: dict[str, Any] | None = None
-        self._paused_error: str | None = None
+        self._stopped = False
+        self._request_id = 0
+        self._requests = {}
         self._reply_handled = False
         self._tools_running = False
         self._pending_tools: deque[dict[str, Any]] = deque()
@@ -214,11 +232,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             App.Qt.translate("KineSketch", "Send"), container
         )
         self.send_button.setDefault(True)
-        self.pause_button = QtWidgets.QPushButton(container)
-        self._update_pause_button()
+        self.stop_button = QtWidgets.QPushButton(container)
+        self._update_stop_button()
         controls.addWidget(self.clear_button)
         controls.addStretch()
-        controls.addWidget(self.pause_button)
+        controls.addWidget(self.stop_button)
         controls.addWidget(self.send_button)
 
         layout.addWidget(connection)
@@ -233,7 +251,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
         self.send_button.clicked.connect(self._send)
         self.clear_button.clicked.connect(self._clear)
-        self.pause_button.clicked.connect(self._toggle_pause)
+        self.stop_button.clicked.connect(self._stop_conversation)
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
         self.image_button.clicked.connect(self._attach_image)
         self.remove_image_button.clicked.connect(self._remove_image)
@@ -313,10 +331,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._append("Image", self._image.filename)
         self._remove_image()
         self.prompt_edit.clear()
+        self._stopped = False
         self._request_model()
 
     def _request_model(self, status_message: str | None = None) -> None:
-        if self._paused:
+        if self._stopped:
             return
         ssh_config = None
         if self.ssh_connection.isChecked():
@@ -340,30 +359,46 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         )
         self._streaming_reply_started = False
         self._reply_handled = False
+        self._request_id += 1
 
         thread = QtCore.QThread(self)
         tools = self._session.request_tools(TOOL_DEFINITIONS)
         worker = _RequestWorker(
             config, self._session.request_messages, tools, self._session.tool_choice,
+            self._request_id,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.content_delta.connect(self._handle_content_delta)
-        worker.completed.connect(self._handle_reply)
-        worker.failed.connect(self._handle_error)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        worker.content_delta.connect(self._receive_content_delta)
+        worker.completed.connect(self._receive_reply)
+        worker.failed.connect(self._receive_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._request_finished)
+        thread.finished.connect(thread.deleteLater)
         self._thread = thread
         self._worker = worker
+        self._requests[thread] = worker
         thread.start()
+
+    @QtCore.Slot(int, str)
+    def _receive_content_delta(self, request_id: int, content: str) -> None:
+        if request_id == self._request_id and not self._stopped:
+            self._handle_content_delta(content)
+
+    @QtCore.Slot(int, object)
+    def _receive_reply(self, request_id: int, message: dict[str, Any]) -> None:
+        if request_id == self._request_id and not self._stopped:
+            self._handle_reply(message)
+
+    @QtCore.Slot(int, str)
+    def _receive_error(self, request_id: int, message: str) -> None:
+        if request_id == self._request_id and not self._stopped:
+            self._handle_error(message)
 
     @QtCore.Slot(object)
     def _handle_reply(self, message: dict[str, Any]) -> None:
-        if self._paused:
-            self._paused_reply = message
+        if self._stopped:
             return
         self._flush_stream()
         self._reply_handled = True
@@ -400,10 +435,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._advance_request()
 
     @QtCore.Slot()
-    def _run_next_tool(self) -> None:
+    def _run_next_tool(self, request_id: int | None = None) -> None:
         """Run one document action, then return to Qt before the next action."""
+        if request_id is not None and request_id != self._request_id:
+            return
         self._tool_step_scheduled = False
-        if self._paused or not self._tools_running:
+        if self._stopped or not self._tools_running:
             return
         try:
             if self._view_pending:
@@ -437,40 +474,40 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._advance_request()
 
     def _schedule_tool_step(self) -> None:
-        if not self._paused and not self._tool_step_scheduled:
+        if not self._stopped and not self._tool_step_scheduled:
             self._tool_step_scheduled = True
-            QtCore.QTimer.singleShot(0, self._run_next_tool)
+            request_id = self._request_id
+            QtCore.QTimer.singleShot(0, lambda: self._run_next_tool(request_id))
 
-    def _update_pause_button(self) -> None:
-        label = "Resume" if self._paused else "Pause"
-        icon = QtWidgets.QStyle.SP_MediaPlay if self._paused else QtWidgets.QStyle.SP_MediaPause
-        self.pause_button.setText(App.Qt.translate("KineSketch", label))
-        self.pause_button.setToolTip(App.Qt.translate("KineSketch", label + " conversation"))
-        self.pause_button.setIcon(self.style().standardIcon(icon))
-        self.pause_button.setEnabled(self._busy)
+    def _update_stop_button(self) -> None:
+        self.stop_button.setText(App.Qt.translate("KineSketch", "Stop"))
+        self.stop_button.setToolTip(App.Qt.translate("KineSketch", "Stop conversation"))
+        self.stop_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop))
+        self.stop_button.setEnabled(self._busy)
 
     @QtCore.Slot()
-    def _toggle_pause(self) -> None:
+    def _stop_conversation(self) -> None:
         if not self._busy:
             return
-        self._paused = not self._paused
-        self._update_pause_button()
-        if self._paused:
-            self._stream_timer.stop()
-            self._set_status(App.Qt.translate("KineSketch", "Conversation paused"), "warning")
-            return
-        self._set_status(App.Qt.translate("KineSketch", "Resuming conversation..."), "busy", busy=True)
-        self._flush_stream()
-        if self._paused_reply is not None:
-            reply, self._paused_reply = self._paused_reply, None
-            self._handle_reply(reply)
-        elif self._paused_error is not None:
-            error, self._paused_error = self._paused_error, None
-            self._handle_error(error)
-        elif self._tools_running:
-            self._schedule_tool_step()
-        else:
-            self._advance_request()
+        self._stopped = True
+        self._request_id += 1
+        self._stream_timer.stop()
+        self._stream_parts.clear()
+        self._pending_tools.clear()
+        self._tools_running = False
+        self._tool_step_scheduled = False
+        self._view_pending = False
+        self._continue_after_finish = False
+        self._reply_handled = True
+        if self._worker is not None:
+            self._worker.cancel()
+        # Keep old workers owned until they finish; allow a new turn immediately.
+        self._thread = None
+        self._worker = None
+        self._session.cancel_turn()
+        self._set_busy(False)
+        self._append("System", App.Qt.translate("KineSketch", "Conversation stopped"))
+        self._set_status(App.Qt.translate("KineSketch", "Conversation stopped"), "ready")
 
     def _show_tool_result(self, name: str, result: str, elapsed: float) -> None:
         data = json.loads(result)
@@ -492,11 +529,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot(str)
     def _handle_content_delta(self, content: str) -> None:
-        if not content:
+        if not content or self._stopped:
             return
         self._stream_parts.append(content)
-        if self._paused:
-            return
         if not self._stream_timer.isActive():
             self._stream_timer.start()
         self._set_status(
@@ -506,7 +541,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     @QtCore.Slot()
     def _flush_stream(self) -> None:
         self._stream_timer.stop()
-        if self._paused:
+        if self._stopped:
             return
         if not self._stream_parts:
             return
@@ -519,8 +554,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
-        if self._paused:
-            self._paused_error = message
+        if self._stopped:
             return
         self._flush_stream()
         self._reply_handled = True
@@ -530,12 +564,16 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _request_finished(self) -> None:
+        thread = self.sender()
+        self._requests.pop(thread, None)
+        if thread is not self._thread:
+            return
         self._thread = None
         self._worker = None
         self._advance_request()
 
     def _advance_request(self) -> None:
-        if self._paused:
+        if self._stopped:
             return
         if self._thread is not None or self._tools_running or not self._reply_handled:
             return
@@ -565,9 +603,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        if not busy:
-            self._paused = False
-        self._update_pause_button()
+        self._update_stop_button()
         self.model_connection.setEnabled(not busy)
         self.ssh_connection.setEnabled(not busy)
         self.prompt_edit.setEnabled(not busy)

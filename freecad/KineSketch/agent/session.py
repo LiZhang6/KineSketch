@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Any
 
 from ..skills import modeling_instructions
@@ -133,6 +134,21 @@ class AgentSession:
         self._tool_retry = False
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._turn_start = 1
+
+    def cancel_turn(self) -> None:
+        """Close unfinished tool calls without claiming they were executed."""
+        turn = self._messages[self._turn_start:]
+        completed = {item.get("tool_call_id") for item in turn if item["role"] == "tool"}
+        for item in turn:
+            for call in item.get("tool_calls", []):
+                if call["id"] not in completed:
+                    self.add_tool_result(call["id"], json.dumps({
+                        "ok": False, "error": "Cancelled by user; action not executed.",
+                    }))
+        self._messages.append({"role": "assistant", "content": "Conversation stopped by user."})
+        self._creation_requested = False
+        self._requested_tool = None
+        self._tool_retry = False
 
     def _trim_history(self) -> None:
         if len(self._messages) > 30:

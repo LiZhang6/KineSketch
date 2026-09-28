@@ -190,12 +190,12 @@ result. These changes reduce redundant work and UI updates, but a single native
 FreeCAD geometry operation or document recompute can still block the GUI while
 it runs. Native responsiveness and timing require testing in FreeCAD.
 
-Use **Pause** during a conversation to suspend streamed display, queued tools
-and subsequent model requests. The button changes to **Resume**, which continues
-the same conversation without repeating completed actions. A request already
-sent to the server may finish in the background; its response or error is held
-until resuming. Pause does not cancel remote inference or interrupt a native
-geometry operation already in progress. The button is disabled when idle.
+Use **Stop** to end the current turn immediately, interrupt its HTTP connection,
+and discard queued tools and late responses. You can send a new message without
+waiting for background connection cleanup. Completed CAD changes are preserved;
+a native geometry operation already running on the GUI thread cannot be safely
+interrupted. Disconnecting does not guarantee the server stops inference. The
+button is disabled when idle; there is no resume action.
 
 ## Modeling Skill and MCP
 
