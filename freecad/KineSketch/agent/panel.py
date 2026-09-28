@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import os
 from typing import Any, ClassVar
+from uuid import uuid4
 
 import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtCore, QtWidgets
 
-from .client import AgentConfig, OpenAICompatibleClient
+from .client import AgentConfig, create_agent_client
 from .session import AgentSession
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
@@ -28,7 +29,7 @@ class _RequestWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            reply = OpenAICompatibleClient(self._config).complete(
+            reply = create_agent_client(self._config).complete(
                 self._messages, TOOL_DEFINITIONS
             )
         except Exception as error:
@@ -52,6 +53,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._thread: QtCore.QThread | None = None
         self._worker: _RequestWorker | None = None
         self._continue_after_finish = False
+        self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
         self._build_ui()
 
@@ -66,22 +68,33 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.endpoint_edit = QtWidgets.QLineEdit(
             self._settings.value(
                 "endpoint",
-                os.getenv("KINESKETCH_ENDPOINT", "http://127.0.0.1:11434/v1"),
+                os.getenv(
+                    "KINESKETCH_AGENT_ENDPOINT",
+                    os.getenv("KINESKETCH_ENDPOINT", "http://127.0.0.1:18789/v1"),
+                ),
             )
         )
         self.model_edit = QtWidgets.QLineEdit(
             self._settings.value(
-                "model", os.getenv("KINESKETCH_MODEL", "qwen2.5:7b")
+                "model",
+                os.getenv(
+                    "KINESKETCH_AGENT_ID",
+                    os.getenv("KINESKETCH_MODEL", "openclaw/default"),
+                ),
             )
         )
-        self.api_key_edit = QtWidgets.QLineEdit(os.getenv("KINESKETCH_API_KEY", ""))
+        self.api_key_edit = QtWidgets.QLineEdit(
+            os.getenv(
+                "KINESKETCH_AGENT_TOKEN", os.getenv("KINESKETCH_API_KEY", "")
+            )
+        )
         self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.api_key_edit.setPlaceholderText(
             App.Qt.translate("KineSketch", "Optional; not saved")
         )
         form.addRow(App.Qt.translate("KineSketch", "Endpoint"), self.endpoint_edit)
-        form.addRow(App.Qt.translate("KineSketch", "Model"), self.model_edit)
-        form.addRow(App.Qt.translate("KineSketch", "API key"), self.api_key_edit)
+        form.addRow(App.Qt.translate("KineSketch", "Agent"), self.model_edit)
+        form.addRow(App.Qt.translate("KineSketch", "Access token"), self.api_key_edit)
 
         self.transcript = QtWidgets.QTextBrowser(container)
         self.transcript.setOpenExternalLinks(True)
@@ -143,12 +156,13 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             endpoint=self.endpoint_edit.text().strip(),
             model=self.model_edit.text().strip(),
             api_key=self.api_key_edit.text(),
+            conversation_id=self._conversation_id,
         )
         self.send_button.setEnabled(False)
         self.send_button.setText(App.Qt.translate("KineSketch", "Working..."))
 
         thread = QtCore.QThread(self)
-        worker = _RequestWorker(config, self._session.messages)
+        worker = _RequestWorker(config, self._session.request_messages)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.completed.connect(self._handle_reply)
@@ -197,7 +211,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._thread is not None:
             return
         self._session.clear()
+        self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
+
+    @staticmethod
+    def _new_conversation_id() -> str:
+        return f"kinesketch:{uuid4().hex}"
 
     def _append(self, speaker: str, text: str) -> None:
         cursor = self.transcript.textCursor()

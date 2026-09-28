@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -22,6 +22,7 @@ class AgentConfig:
     endpoint: str
     model: str
     api_key: str = ""
+    conversation_id: str = ""
     timeout: float = 90.0
 
     @property
@@ -30,6 +31,16 @@ class AgentConfig:
         if endpoint.endswith("/chat/completions"):
             return endpoint
         return f"{endpoint}/chat/completions"
+
+
+class AgentClient(Protocol):
+    """Transport boundary implemented by remote agent backends."""
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class OpenAICompatibleClient:
@@ -52,6 +63,8 @@ class OpenAICompatibleClient:
             "messages": messages,
             "temperature": 0.2,
         }
+        if self.config.conversation_id:
+            payload["user"] = self.config.conversation_id
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -89,3 +102,8 @@ class OpenAICompatibleClient:
         if not isinstance(message, dict):
             raise AgentClientError("Model response contains an invalid assistant message")
         return message
+
+
+def create_agent_client(config: AgentConfig) -> AgentClient:
+    """Create the configured remote agent transport."""
+    return OpenAICompatibleClient(config)

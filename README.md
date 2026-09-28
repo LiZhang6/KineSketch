@@ -20,28 +20,56 @@ Python's standard library.
 3. Select **KineSketch > Open Agent** or use the KineSketch toolbar button.
 4. Enter an endpoint and model, then ask the agent to create or modify geometry.
 
-For a local Ollama server:
+For an OpenClaw Gateway running on the same machine:
 
 ```text
-Endpoint: http://127.0.0.1:11434/v1
-Model:    qwen2.5:7b
-API key:  (empty)
+Endpoint:     http://127.0.0.1:18789/v1
+Agent:        openclaw/default
+Access token: your OpenClaw Gateway token
 ```
 
-The selected model must support OpenAI-style function/tool calling. Cloud and
-self-hosted OpenAI-compatible services can be used by changing the endpoint,
-model, and API key fields.
+The OpenClaw Chat Completions endpoint must be enabled on the Gateway:
+
+```json5
+{
+	gateway: {
+		http: {
+			endpoints: {
+				chatCompletions: { enabled: true }
+			}
+		}
+	}
+}
+```
+
+For a remote deployment, use an HTTPS endpoint such as
+`https://agent.example.com/v1`. Keep the Gateway behind private ingress or an
+authenticated reverse proxy; its bearer token grants operator-level access.
+`openclaw/default` selects the default remote Agent, while
+`openclaw/<agentId>` selects a specific configured Agent. The underlying AI
+model and provider credentials remain entirely in the remote OpenClaw environment.
 
 These environment variables provide startup defaults:
 
 ```powershell
-$env:KINESKETCH_ENDPOINT = "https://api.openai.com/v1"
-$env:KINESKETCH_MODEL = "gpt-4.1-mini"
-$env:KINESKETCH_API_KEY = "..."
+$env:KINESKETCH_AGENT_ENDPOINT = "https://agent.example.com/v1"
+$env:KINESKETCH_AGENT_ID = "openclaw/default"
+$env:KINESKETCH_AGENT_TOKEN = "..."
 ```
 
-The endpoint and model are saved in local Qt settings. The API key is retained
-only by the current panel and is never written to FreeCAD settings.
+The endpoint and Agent ID are saved in local Qt settings. The access token is
+retained only by the current panel and is never written to FreeCAD settings.
+The older `KINESKETCH_ENDPOINT`, `KINESKETCH_MODEL`, and `KINESKETCH_API_KEY`
+environment variables remain supported as fallbacks.
+
+Each chat panel creates an application-owned conversation ID and sends it as the
+OpenAI `user` field. OpenClaw therefore retains one remote session until the user
+presses **Clear**, which starts a new conversation.
+
+The transport boundary is `AgentClient` in
+`freecad/KineSketch/agent/client.py`. Its factory currently returns the
+OpenAI-compatible HTTP implementation, leaving the UI independent from a future
+Gateway Protocol or alternative remote Agent transport.
 
 ## Agent Tools
 

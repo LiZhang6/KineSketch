@@ -24,16 +24,22 @@ class AgentSession:
         self._messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
+        self._turn_start = 1
 
     @property
     def messages(self) -> list[dict[str, Any]]:
         return list(self._messages)
 
+    @property
+    def request_messages(self) -> list[dict[str, Any]]:
+        return [self._messages[0], *self._messages[self._turn_start :]]
+
     def begin(self, user_text: str, document_context: str) -> None:
         self._tool_rounds = 0
+        self._trim_history()
+        self._turn_start = len(self._messages)
         content = f"Current FreeCAD document:\n{document_context}\n\nUser request:\n{user_text}"
         self._messages.append({"role": "user", "content": content})
-        self._trim_history()
 
     def accept_assistant(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         stored: dict[str, Any] = {
@@ -61,6 +67,7 @@ class AgentSession:
     def clear(self) -> None:
         self._tool_rounds = 0
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._turn_start = 1
 
     def _trim_history(self) -> None:
         if len(self._messages) > 30:
