@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import FreeCAD as App
 import FreeCADGui as Gui
-from PySide import QtCore, QtWidgets
+from PySide import QtCore, QtGui, QtWidgets
 
 from .client import AgentConfig, create_agent_client
 from .session import AgentSession
@@ -266,7 +266,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     def _append(self, speaker: str, text: str) -> None:
         cursor = self.transcript.textCursor()
-        cursor.movePosition(cursor.End)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         if not self.transcript.document().isEmpty():
             cursor.insertText("\n\n")
         cursor.insertText(f"{speaker}\n{text}")
