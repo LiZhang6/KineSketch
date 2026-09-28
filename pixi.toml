@@ -1,7 +1,7 @@
 [project]
 authors = ["me <710559583@qq.com>"]
 channels = ["freecad/label/dev", "conda-forge"]
-description = "KineSketch does something cool."
+description = "An AI agent integrated into FreeCAD for parametric modeling."
 name = "freecad.KineSketch"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64", "win-64", "osx-64"]
 version = "0.1.0"

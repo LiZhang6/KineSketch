@@ -51,3 +51,4 @@ Good practices:
 
 from .example_command import ExampleCommand as ExampleCommand
 from .example_manipulator import WorkbenchManipulator as WorkbenchManipulator
+from .agent_command import AgentCommand as AgentCommand

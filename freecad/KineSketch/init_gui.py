@@ -15,7 +15,7 @@ Keep this file fast - it runs on every FreeCAD GUI startup.
 """
 
 from .resources import Resources
-from .commands import ExampleCommand, WorkbenchManipulator
+from .commands import AgentCommand, ExampleCommand, WorkbenchManipulator
 from .example_workbench import KineSketchWorkbench
 
 # Install icons (optional)
@@ -25,6 +25,7 @@ Resources.gui_register_icons()
 Resources.gui_register_translations()
 
 # Install commands
+AgentCommand.Install()
 ExampleCommand.Install()
 
 # Add Commands to the Gui

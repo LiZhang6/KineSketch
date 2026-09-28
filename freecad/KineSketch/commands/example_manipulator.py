@@ -9,7 +9,7 @@ from typing import ClassVar
 
 import FreeCAD as App
 
-from .example_command import ExampleCommand
+from .agent_command import AgentCommand
 
 
 class WorkbenchManipulator:
@@ -27,8 +27,7 @@ class WorkbenchManipulator:
 
     def modifyToolBars(self) -> list[dict[str, str]]:
         """Add commands to toolbars."""
-        # Add our example command to the File toolbar
-        return [{"append": ExampleCommand.Name, "toolBar": "File"}]
+        return [{"append": AgentCommand.Name, "toolBar": "File"}]
 
     # Optional but useful (good practice to encapsulate here)
     @classmethod

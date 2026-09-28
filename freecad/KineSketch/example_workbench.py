@@ -8,18 +8,18 @@ import FreeCADGui as Gui
 translate = App.Qt.translate
 
 from .resources import Resources
-from .commands import ExampleCommand
+from .commands import AgentCommand, ExampleCommand
 
 class KineSketchWorkbench(Gui.Workbench):
 
     MenuText: str = translate(
             "KineSketch",
-            "Example Workbench",
+            "KineSketch",
         )
 
     ToolTip: str = translate(
             "KineSketch",
-            "Example Workbench tooltip",
+            "AI-assisted parametric modeling",
         )
 
     Icon: str = Resources.icon("KineSketch-wb.svg")
@@ -28,7 +28,7 @@ class KineSketchWorkbench(Gui.Workbench):
     def Initialize(self) -> None:
         App.Console.PrintMessage("Example Workbench initialized\n")
         # Adding menus and toolbars when the Workbench is active (example)
-        commands = [ExampleCommand.Name]
+        commands = [AgentCommand.Name, ExampleCommand.Name]
         self.appendToolbar("KineSketch", commands)
         self.appendMenu("KineSketch", commands)
 

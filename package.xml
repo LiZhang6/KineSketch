@@ -67,7 +67,7 @@
         <workbench>
             <name>KineSketch</name>
             <classname>KineSketchWorkbench</classname>
-            <description>Example workbench</description>
+            <description>AI-assisted parametric modeling workbench</description>
             <subdirectory>./</subdirectory>
             <icon>freecad/KineSketch/resources/icons/KineSketch-wb.svg</icon>
         </workbench>
