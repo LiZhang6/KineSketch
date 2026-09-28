@@ -22,12 +22,12 @@ Python's standard library and the system OpenSSH client.
 4. Select **KineSketch > Open Agent** or use the KineSketch toolbar button.
 5. Ask the agent to create or modify geometry.
 
-For an OpenClaw Gateway running on the same machine:
+The default configuration connects to the model service on the remote server:
 
 ```text
-Endpoint:     http://127.0.0.1:18789/v1
-Agent:        openclaw/default
-Access token: your OpenClaw Gateway token
+Endpoint:     http://127.0.0.1:11434/v1
+Agent:        modelscope.cn/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M
+Access token: leave empty for this deployment
 ```
 
 The checked **SSH key tunnel** section is preconfigured for this deployment:
@@ -38,10 +38,10 @@ Port:     6010
 Username: asus_gx10
 ```
 
-With SSH enabled, the endpoint identifies the Gateway from the remote server's
-point of view. The default `http://127.0.0.1:18789/v1` is forwarded through a
-random loopback port, so the Gateway does not need to be exposed publicly. The
-Gateway access token is kept only in the current panel and is never written to
+With SSH enabled, the endpoint identifies the service from the remote server's
+point of view. The default `http://127.0.0.1:11434/v1` is forwarded through a
+random loopback port, so the service does not need to be exposed publicly. The
+optional access token is kept only in the current panel and is never written to
 Qt settings or logs.
 
 KineSketch starts OpenSSH with batch mode, password authentication disabled, and
@@ -62,7 +62,10 @@ password prompt:
 ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p 6010 asus_gx10@61.172.235.130 exit
 ```
 
-The OpenClaw Chat Completions endpoint must be enabled on the Gateway:
+OpenClaw is optional, not required by the default deployment. To use an OpenClaw
+Gateway instead, enter its actual endpoint (commonly
+`http://127.0.0.1:18789/v1`), Agent ID and access token, and enable its Chat
+Completions endpoint:
 
 ```json5
 {
@@ -78,18 +81,17 @@ The OpenClaw Chat Completions endpoint must be enabled on the Gateway:
 
 For a remote deployment without the built-in SSH tunnel, uncheck **SSH key tunnel**
 and use an HTTPS endpoint such as `https://agent.example.com/v1`. Keep the
-Gateway behind private ingress or an authenticated reverse proxy; its bearer
-token grants operator-level access.
-`openclaw/default` selects the default remote Agent, while
-`openclaw/<agentId>` selects a specific configured Agent. The underlying AI
-model and provider credentials remain entirely in the remote OpenClaw environment.
+service behind private ingress or an authenticated reverse proxy.
+For a direct model service, the Agent field contains the exact model ID returned
+by `/v1/models`. For OpenClaw only, `openclaw/default` selects the default remote
+Agent and `openclaw/<agentId>` selects a specific configured Agent.
 
 These environment variables provide startup defaults:
 
 ```powershell
-$env:KINESKETCH_AGENT_ENDPOINT = "http://127.0.0.1:18789/v1"
-$env:KINESKETCH_AGENT_ID = "openclaw/default"
-$env:KINESKETCH_AGENT_TOKEN = "..."
+$env:KINESKETCH_AGENT_ENDPOINT = "http://127.0.0.1:11434/v1"
+$env:KINESKETCH_AGENT_ID = "modelscope.cn/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+$env:KINESKETCH_AGENT_TOKEN = ""
 $env:KINESKETCH_SSH_HOST = "61.172.235.130"
 $env:KINESKETCH_SSH_PORT = "6010"
 $env:KINESKETCH_SSH_USER = "asus_gx10"
@@ -99,10 +101,23 @@ The endpoint and Agent ID are saved in local Qt settings. The access token is
 retained only by the current panel and is never written to FreeCAD settings.
 The older `KINESKETCH_ENDPOINT`, `KINESKETCH_MODEL`, and `KINESKETCH_API_KEY`
 environment variables remain supported as fallbacks.
+The retired saved default pair (`18789/v1`, `openclaw/default`) is replaced by
+these startup defaults when opening the panel; other saved configurations are
+preserved. To intentionally reuse that old pair, supply it via the environment.
 
 Each chat panel creates an application-owned conversation ID and sends it as the
-OpenAI `user` field. OpenClaw therefore retains one remote session until the user
-presses **Clear**, which starts a new conversation.
+OpenAI `user` field. OpenClaw can use it to retain a remote session until the user
+presses **Clear**. A direct model service may ignore this ID; it does not imply
+server-side conversation memory. The current client sends the current turn and
+its tool rounds, not earlier turns.
+
+For an explicit creation request, the panel requires a tool call on the first
+round. A crank creation request offers `create_crank` first, with optional
+arguments and feasible defaults. Informational and how-to questions do not
+force document edits. After executing tools, normal tool selection resumes for
+view fitting, saving and the final reply. If the model returns only text instead
+of an action, the panel asks once more, then reports a tool-calling error; it
+does not silently create a part locally or retry interrupted network requests.
 
 The transport boundary is `AgentClient` in
 `freecad/KineSketch/agent/client.py`. Its factory selects either direct HTTP or
@@ -161,6 +176,19 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
+
+Streamed text is batched in the worker and refreshed by the panel at 75 ms
+intervals, with a final flush when a response ends. Tool calls run one at a time
+through the Qt event loop. The panel stays busy until both the network thread
+and the tool queue finish; switching active documents skips remaining actions
+instead of writing into the wrong document. Successful creation shows the tool
+result and elapsed time immediately and fits the view locally, before the next
+model request. View-fitting failure does not undo creation or prevent saving.
+
+Crank recompute reads the inertia matrix once and creation reuses its physics
+result. These changes reduce redundant work and UI updates, but a single native
+FreeCAD geometry operation or document recompute can still block the GUI while
+it runs. Native responsiveness and timing require testing in FreeCAD.
 
 ## Modeling Skill and MCP
 

@@ -9,6 +9,26 @@ Use the bound `kinesketch` MCP server's `inspect_document`, `generate_model`, an
 `save_model` tools. The embedded FreeCAD agent exposes the same tools directly
 with the same schemas and implementation.
 
+## Execute Creation Requests
+
+A request to create a part authorizes modeling, not merely a modeling tutorial.
+For "生成一个曲柄模型" (generate a crank model) with no parameters,
+call `create_crank` with an empty argument object `{}` immediately. Do not ask
+for dimensions or density, return Python code, or substitute a generic cylinder.
+For a partial crank description, pass only the explicitly known values and
+let the tool fill the rest. Do not guess values for every optional field.
+After successful creation, the embedded panel reports the tool result and fits
+the view locally; do not request another `fit_view` solely to show that new part.
+In an external MCP client, `fit_view` is optional and requires a GUI.
+Then report the object name, actual dimensions, density source and assumptions
+from the tool result in the user's language. Do not create the same part again
+while summarizing tool results. Save only if requested and a destination is known.
+If creation fails, report the actual error; never describe a failed model as created.
+
+Questions such as "how do I create a crank?" are informational and do not
+authorize changing the document. Conflicting explicit constraints require
+clarification rather than overriding the user's values.
+
 ## Image Inputs
 
 When the user supplies a photo, drawing or screenshot, use vision to identify

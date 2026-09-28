@@ -110,7 +110,8 @@ def mass_properties(shape: Any, density: float) -> dict[str, Any]:
     volume = float(shape.Volume) * 1e-9
     mass = density * volume
     centre = shape.CenterOfMass
-    inertia = {key: float(getattr(shape.MatrixOfInertia, field)) * density * 1e-15
+    matrix = shape.MatrixOfInertia
+    inertia = {key: float(getattr(matrix, field)) * density * 1e-15
                for key, field in INERTIA_FIELDS.items()}
     # Parallel-axis theorem about the shaft's local Z axis through x=y=0.
     shaft_inertia = inertia["Izz"] + mass * ((centre.x * 1e-3) ** 2 + (centre.y * 1e-3) ** 2)
@@ -127,11 +128,15 @@ def mass_properties(shape: Any, density: float) -> dict[str, Any]:
 class CrankProxy:
     """Rebuild geometry and physical properties whenever input properties change."""
 
+    def __init__(self) -> None:
+        self.properties = None
+
     def execute(self, obj) -> None:
         import FreeCAD as App
         import Part
 
         self.error = ""
+        self.properties = None
         try:
             arguments = {key: float(getattr(obj, prop).Value) for key, prop in DIMENSIONS.items()}
             arguments["density"] = float(obj.Density.getValueAs("kg/m^3").Value)
@@ -157,6 +162,7 @@ class CrankProxy:
             for key, value in properties["inertia_kg_m2"].items():
                 setattr(obj, key, f"{value:.17g} kg*m^2")
             obj.ShaftInertia = f"{properties['shaft_inertia_kg_m2']:.17g} kg*m^2"
+            self.properties = properties
         except Exception as error:
             self.error = str(error)
             raise
@@ -166,6 +172,7 @@ class CrankProxy:
 
     def loads(self, state):
         self.error = ""
+        self.properties = None
 
 
 def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -205,7 +212,9 @@ def create_crank(arguments: dict[str, Any]) -> dict[str, Any]:
         for name in ("Mass", "CenterOfMass", *INERTIA_FIELDS, "ShaftInertia",
                      "PhysicsAssumption", "InertiaFrame"):
             obj.setEditorMode(name, 1)
-        properties = mass_properties(obj.Shape, arguments["density"])
+        properties = obj.Proxy.properties
+        if properties is None:
+            properties = mass_properties(obj.Shape, arguments["density"])
         document.commitTransaction()
     except Exception:
         document.abortTransaction()

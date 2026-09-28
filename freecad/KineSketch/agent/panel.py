@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import os
+import json
+import time
+from collections import deque
 from typing import Any, ClassVar
 from uuid import uuid4
 
@@ -13,6 +16,7 @@ import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
 from .client import AgentConfig, create_agent_client
+from .defaults import connection_defaults
 from .images import ImageAttachment, load_image
 from .session import AgentSession
 from .ssh_tunnel import SSHConfig
@@ -24,22 +28,46 @@ class _RequestWorker(QtCore.QObject):
     completed = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, config: AgentConfig, messages: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, config: AgentConfig, messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]], tool_choice: str,
+    ) -> None:
         super().__init__()
         self._config = config
         self._messages = messages
+        self._tools = tools
+        self._tool_choice = tool_choice
+        self._stream_parts: list[str] = []
+        self._stream_size = 0
+        self._last_stream_emit = time.monotonic()
+
+    def _buffer_content(self, content: str) -> None:
+        self._stream_parts.append(content)
+        self._stream_size += len(content)
+        if self._stream_size >= 4096 or time.monotonic() - self._last_stream_emit >= 0.075:
+            self._flush_content()
+
+    def _flush_content(self) -> None:
+        if self._stream_parts:
+            self.content_delta.emit("".join(self._stream_parts))
+            self._stream_parts.clear()
+            self._stream_size = 0
+            self._last_stream_emit = time.monotonic()
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
             reply = create_agent_client(self._config).complete(
                 self._messages,
-                TOOL_DEFINITIONS,
-                on_content=self.content_delta.emit,
+                self._tools,
+                on_content=self._buffer_content,
+                tool_choice=self._tool_choice,
             )
         except Exception as error:
+            self._flush_content()
             self.failed.emit(str(error))
             return
+        self._flush_content()
         self.completed.emit(reply)
 
 
@@ -59,10 +87,22 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._thread: QtCore.QThread | None = None
         self._worker: _RequestWorker | None = None
         self._continue_after_finish = False
+        self._busy = False
+        self._reply_handled = False
+        self._tools_running = False
+        self._pending_tools: deque[dict[str, Any]] = deque()
+        self._view_pending = False
+        self._tool_document = None
+        self._stream_parts: list[str] = []
+        self._status_signature = None
         self._streaming_reply_started = False
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
         self._build_ui()
+        self._stream_timer = QtCore.QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(75)
+        self._stream_timer.timeout.connect(self._flush_stream)
 
     def _build_ui(self) -> None:
         container = QtWidgets.QWidget(self)
@@ -73,24 +113,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         )
         self.model_connection = connection
         form = QtWidgets.QFormLayout(connection)
-        self.endpoint_edit = QtWidgets.QLineEdit(
-            self._settings.value(
-                "endpoint",
-                os.getenv(
-                    "KINESKETCH_AGENT_ENDPOINT",
-                    os.getenv("KINESKETCH_ENDPOINT", "http://127.0.0.1:18789/v1"),
-                ),
-            )
+        endpoint, model = connection_defaults(
+            self._settings.value("endpoint"), self._settings.value("model"), os.environ,
         )
-        self.model_edit = QtWidgets.QLineEdit(
-            self._settings.value(
-                "model",
-                os.getenv(
-                    "KINESKETCH_AGENT_ID",
-                    os.getenv("KINESKETCH_MODEL", "openclaw/default"),
-                ),
-            )
-        )
+        self.endpoint_edit = QtWidgets.QLineEdit(endpoint)
+        self.model_edit = QtWidgets.QLineEdit(model)
         self.api_key_edit = QtWidgets.QLineEdit(
             os.getenv(
                 "KINESKETCH_AGENT_TOKEN", os.getenv("KINESKETCH_API_KEY", "")
@@ -205,7 +232,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _attach_image(self) -> None:
-        if self._thread is not None:
+        if self._busy:
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, App.Qt.translate("KineSketch", "Attach image"), "",
@@ -224,7 +251,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _remove_image(self) -> None:
-        if self._thread is not None:
+        if self._busy:
             return
         self._image = None
         self.image_label.clear()
@@ -232,7 +259,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _send(self) -> None:
-        if self._thread is not None:
+        if self._busy:
             return
         prompt = self.prompt_edit.toPlainText().strip()
         endpoint = self.endpoint_edit.text().strip()
@@ -302,9 +329,13 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             busy=True,
         )
         self._streaming_reply_started = False
+        self._reply_handled = False
 
         thread = QtCore.QThread(self)
-        worker = _RequestWorker(config, self._session.request_messages)
+        tools = self._session.request_tools(TOOL_DEFINITIONS)
+        worker = _RequestWorker(
+            config, self._session.request_messages, tools, self._session.tool_choice,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.content_delta.connect(self._handle_content_delta)
@@ -321,6 +352,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot(object)
     def _handle_reply(self, message: dict[str, Any]) -> None:
+        self._flush_stream()
+        self._reply_handled = True
         try:
             tool_calls = self._session.accept_assistant(message)
             if tool_calls:
@@ -330,11 +363,16 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                     "warning",
                     busy=True,
                 )
-                for tool_call in tool_calls:
-                    result = execute_tool_call(tool_call)
-                    self._session.add_tool_result(str(tool_call.get("id", "")), result)
-                self._session.continue_after_tools()
+                self._pending_tools.extend(tool_calls)
+                self._tools_running = True
+                self._tool_document = App.ActiveDocument
+                QtCore.QTimer.singleShot(0, self._run_next_tool)
+                return
+            if self._session.retry_missing_tool():
                 self._continue_after_finish = True
+                self._set_status(
+                    App.Qt.translate("KineSketch", "Requesting model action..."), "busy", busy=True,
+                )
                 return
             self._append_unstreamed_content(message)
             self._set_status(
@@ -345,30 +383,101 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._set_status(
                 App.Qt.translate("KineSketch", "Agent action failed"), "error"
             )
+        finally:
+            self._advance_request()
+
+    @QtCore.Slot()
+    def _run_next_tool(self) -> None:
+        """Run one document action, then return to Qt before the next action."""
+        try:
+            if self._view_pending:
+                self._view_pending = False
+                if App.ActiveDocument == self._tool_document:
+                    self._fit_created_view()
+                QtCore.QTimer.singleShot(0, self._run_next_tool)
+                return
+            if self._pending_tools:
+                call = self._pending_tools.popleft()
+                name = call.get("function", {}).get("name", "unknown")
+                self._set_status(f"Applying {name}...", "warning", busy=True)
+                started = time.perf_counter()
+                if App.ActiveDocument != self._tool_document:
+                    result = json.dumps({"ok": False, "error": "Active document changed; action skipped."})
+                else:
+                    result = execute_tool_call(call)
+                    self._tool_document = App.ActiveDocument
+                self._session.add_tool_result(str(call.get("id", "")), result)
+                self._show_tool_result(name, result, time.perf_counter() - started)
+                QtCore.QTimer.singleShot(0, self._run_next_tool)
+                return
+            self._session.continue_after_tools()
+            self._continue_after_finish = True
+        except Exception as error:
+            self._pending_tools.clear()
+            self._view_pending = False
+            self._append("System", str(error))
+            self._set_status(App.Qt.translate("KineSketch", "Agent action failed"), "error")
+        self._tools_running = False
+        self._advance_request()
+
+    def _show_tool_result(self, name: str, result: str, elapsed: float) -> None:
+        data = json.loads(result)
+        if not data.get("ok"):
+            self._append("Tool", f"{name}: {data.get('error', 'Action failed')} ({elapsed:.2f} s)")
+            return
+        if name in {"create_crank", "create_box", "create_cylinder", "generate_model"}:
+            details = {key: data[key] for key in ("name", "results", "parameters", "density_source", "modeling_assumptions") if key in data}
+            self._append("Tool", f"{name} completed ({elapsed:.2f} s)\n" + json.dumps(details, ensure_ascii=False, indent=2))
+            self._view_pending = bool(App.GuiUp and App.ActiveDocument is not None)
+
+    def _fit_created_view(self) -> None:
+        try:
+            result = json.loads(execute_tool_call({"function": {"name": "fit_view", "arguments": "{}"}}))
+            if not result.get("ok"):
+                raise ValueError(result.get("error", "View fitting failed"))
+        except Exception as error:
+            self._append("System", f"Model created, but view fitting failed: {error}")
 
     @QtCore.Slot(str)
     def _handle_content_delta(self, content: str) -> None:
         if not content:
             return
+        self._stream_parts.append(content)
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+        self._set_status(
+            App.Qt.translate("KineSketch", "Receiving response..."), "busy", busy=True,
+        )
+
+    @QtCore.Slot()
+    def _flush_stream(self) -> None:
+        self._stream_timer.stop()
+        if not self._stream_parts:
+            return
+        content = "".join(self._stream_parts)
+        self._stream_parts.clear()
         if not self._streaming_reply_started:
             self._begin_stream("KineSketch")
             self._streaming_reply_started = True
         self._append_stream_text(content)
-        self._set_status(
-            App.Qt.translate("KineSketch", "Receiving response..."),
-            "busy",
-            busy=True,
-        )
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
+        self._flush_stream()
+        self._reply_handled = True
         self._append("System", message)
         self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
+        self._advance_request()
 
     @QtCore.Slot()
     def _request_finished(self) -> None:
         self._thread = None
         self._worker = None
+        self._advance_request()
+
+    def _advance_request(self) -> None:
+        if self._thread is not None or self._tools_running or not self._reply_handled:
+            return
         if self._continue_after_finish:
             self._continue_after_finish = False
             self._request_model(
@@ -379,9 +488,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _clear(self) -> None:
-        if self._thread is not None:
+        if self._busy:
             return
         self._session.clear()
+        self._stream_timer.stop()
+        self._stream_parts.clear()
         self._remove_image()
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
@@ -392,6 +503,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         return f"kinesketch:{uuid4().hex}"
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
         self.model_connection.setEnabled(not busy)
         self.ssh_connection.setEnabled(not busy)
         self.prompt_edit.setEnabled(not busy)
@@ -406,6 +518,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         )
 
     def _set_status(self, message: str, state: str, *, busy: bool = False) -> None:
+        signature = (message, state, busy)
+        if signature == self._status_signature:
+            return
+        self._status_signature = signature
         colors = {
             "ready": "#2e7d32",
             "busy": "#1976d2",
