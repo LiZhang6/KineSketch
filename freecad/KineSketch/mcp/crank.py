@@ -105,8 +105,23 @@ def validate_crank(arguments: dict[str, Any]) -> None:
         raise ValueError("Shaft and pin holes must not overlap or touch")
 
 
+def _single_solid(shape: Any) -> Any:
+    if shape.isNull() or not shape.isValid():
+        raise ValueError("Crank must be one valid solid")
+    solids = shape.Solids
+    if len(solids) != 1:
+        raise ValueError("Crank must be one valid solid")
+    # OCC boolean operations can wrap a single solid in a Compound.
+    solid = solids[0]
+    if solid.isNull() or not solid.isValid() or solid.Volume <= 0:
+        raise ValueError("Crank must be one valid solid")
+    return solid
+
+
 def mass_properties(shape: Any, density: float) -> dict[str, Any]:
     """Convert OCC volume integrals in mm to mass and centroidal inertia in SI."""
+    if getattr(shape, "ShapeType", None) in ("Compound", "CompSolid"):
+        shape = _single_solid(shape)
     volume = float(shape.Volume) * 1e-9
     mass = density * volume
     centre = shape.CenterOfMass
@@ -152,9 +167,7 @@ class CrankProxy:
                                 (length, arguments["pin_diameter"])):
                 body = body.cut(Part.makeCylinder(diameter / 2, height + 2 * margin,
                                                  App.Vector(x, 0, -margin)))
-            body = body.removeSplitter()
-            if body.isNull() or not body.isValid() or len(body.Solids) != 1 or body.Volume <= 0:
-                raise ValueError("Crank must be one valid solid")
+            body = _single_solid(body.removeSplitter())
             properties = mass_properties(body, arguments["density"])
             obj.Shape = body
             obj.Mass = f"{properties['mass_kg']:.17g} kg"
