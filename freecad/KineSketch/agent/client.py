@@ -48,6 +48,9 @@ class AgentConfig:
     conversation_id: str = ""
     timeout: float = 90.0
     ssh: SSHConfig | None = None
+    max_tokens: int | None = None
+    think: bool | None = None
+    tool_choice: str | dict[str, Any] = "auto"
 
     @property
     def chat_completions_url(self) -> str:
@@ -98,6 +101,10 @@ class OpenAICompatibleClient:
         }
         if self.config.conversation_id:
             payload["user"] = self.config.conversation_id
+        if self.config.max_tokens is not None:
+            payload["max_tokens"] = self.config.max_tokens
+        if self.config.think is not None:
+            payload["think"] = self.config.think
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
@@ -143,6 +150,10 @@ class OpenAICompatibleClient:
             raise AgentClientError("Model response contains no assistant message") from error
         if not isinstance(message, dict):
             raise AgentClientError("Model response contains an invalid assistant message")
+        if not message.get("content") and not message.get("tool_calls"):
+            raise AgentClientError(
+                "Model returned no text or tool calls; increase the endpoint's output token limit"
+            )
         return message
 
 
@@ -322,6 +333,10 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
     }
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    if not message["content"] and not tool_calls:
+        raise AgentClientError(
+            "Model returned no text or tool calls; increase the endpoint's output token limit"
+        )
     return message
 
 

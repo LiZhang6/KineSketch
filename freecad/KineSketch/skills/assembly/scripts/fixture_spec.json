@@ -1,0 +1,12 @@
+{
+  "mechanism_type": "slider_crank",
+  "units": {
+    "length": "mm",
+    "angle": "rad"
+  },
+  "parameters": {
+    "crank_radius_mm": 30,
+    "rod_length_mm": 120,
+    "offset_mm": 0
+  }
+}
