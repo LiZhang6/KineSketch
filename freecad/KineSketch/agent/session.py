@@ -53,8 +53,9 @@ VIEWPORT_TOOL_PROMPT = (
 )
 
 POST_ACTION_REVIEW_PROMPT = (
-    "Experimental visual check of the FreeCAD viewport after the actions above. "
+    "Experimental visual check of FreeCAD viewport images after the actions above. "
     "Compare the visible result with the original user request and tool results. "
+    "For motion frames, compare the beginning and middle of the exported video. "
     "State whether the visible result appears consistent, list concrete visible "
     "problems, and say what the screenshot cannot verify. Do not call tools."
 )

@@ -301,6 +301,61 @@ class AgentGuiTests(unittest.TestCase):
         self.assertTrue(image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertLessEqual(len(image_bytes), 8 * 1024 * 1024)
 
+    def test_blank_viewport_image_is_rejected(self):
+        from PySide import QtGui
+        from freecad.KineSketch.agent.vision import load_png_image
+
+        blank = self.scratch / "blank.png"
+        image = QtGui.QImage(1024, 768, QtGui.QImage.Format_RGB32)
+        image.fill(QtGui.QColor("white"))
+        self.assertTrue(image.save(str(blank)))
+        with self.assertRaisesRegex(ValueError, "blank"):
+            load_png_image(blank)
+
+    def test_previous_slider_crank_prompt_reviews_exported_motion_frames(self):
+        from PySide import QtGui
+        from freecad.KineSketch.agent import panel as panel_module
+
+        prompt_file = (Path(__file__).resolve().parents[1] / "docs"
+                       / "slider_crank_gui_demo_prompt_zh.md")
+        prompt = prompt_file.read_text(encoding="utf-8").split("```text", 1)[1].split("```", 1)[0].strip()
+        self.assertIn("32 mm", prompt)
+        self.assertIn("126 mm", prompt)
+        frames = self.scratch / "freecad_native_3d_frames"
+        frames.mkdir()
+        for index, x in ((0, 250), (60, 550)):
+            image = QtGui.QImage(1280, 720, QtGui.QImage.Format_RGB32)
+            image.fill(QtGui.QColor("white"))
+            painter = QtGui.QPainter(image)
+            painter.fillRect(x, 250, 180, 120, QtGui.QColor("gray"))
+            painter.end()
+            self.assertTrue(image.save(str(frames / f"frame_{index:04d}.png")))
+
+        completed = {
+            "ok": True,
+            "geometry": {"preview": "parts_preview.FCStd"},
+            "assembly": {"solver_return_code": 0, "project": "assembly.FCStd"},
+            "simulation": {"sampled_frames": 401, "native_frames": 402,
+                           "project": "simulation.FCStd", "csv": "motion.csv"},
+            "video": {"verified_frames": 120,
+                      "mp4": str(self.scratch / "freecad_native_3d.mp4")},
+            "playback_seconds": 120,
+        }
+        self.panel.visual_check.setChecked(True)
+        self.begin_turn(prompt)
+        with patch.object(panel_module, "execute_tool_call", return_value=json.dumps(completed)):
+            with patch.object(panel_module, "capture_viewport",
+                              side_effect=AssertionError("Use verified video frames")):
+                with patch.object(self.panel, "_request_model") as request_model:
+                    self.panel._handle_reply({"role": "assistant", "tool_calls": [
+                        tool_call("build_slider_crank_from_plan", {}, "build")
+                    ]})
+        self.assertEqual(request_model.call_args.kwargs, {"review_only": True})
+        content = self.panel._session.request_messages[-1]["content"]
+        self.assertEqual([item["type"] for item in content],
+                         ["text", "image_url", "image_url"])
+        self.assertNotIn("base64", self.panel.transcript.toPlainText())
+
     def test_experimental_post_action_check_uses_one_image_only_round(self):
         self.panel.visual_check.setChecked(True)
         self.begin_turn("Create a box and visually check it.")

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Thread
 from typing import Any, ClassVar
@@ -20,7 +21,7 @@ from .client import AgentConfig, create_agent_client
 from .session import AgentSession
 from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call, local_tool_summary
-from .vision import capture_viewport
+from .vision import capture_viewport, load_png_image, video_review_frames
 
 
 _VISUAL_CHANGE_TOOLS = frozenset({
@@ -74,6 +75,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._visual_change_this_turn = False
         self._viewport_sent_this_turn = False
         self._visual_check_failed = False
+        self._review_frames: list[Path] = []
         self._next_request_review = False
         self._review_request = False
         self._streaming_reply_started = False
@@ -257,6 +259,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._visual_change_this_turn = False
         self._viewport_sent_this_turn = False
         self._visual_check_failed = False
+        self._review_frames = []
         self._append("You", prompt)
         self.prompt_edit.clear()
         self._request_model()
@@ -369,6 +372,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                     if result_data.get("ok") and name in _VISUAL_CHANGE_TOOLS:
                         self._visual_change_this_turn = True
                         self._viewport_sent_this_turn = False
+                        video = result_data.get("video")
+                        self._review_frames = (
+                            video_review_frames(video)
+                            if name == "build_slider_crank_from_plan"
+                            and isinstance(video, dict) else []
+                        )
                     local_summaries.append(local_tool_summary(name, visible_result))
                 if viewport_images:
                     self._session.add_viewport_images(
@@ -430,16 +439,19 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 or self._viewport_sent_this_turn or self._visual_check_failed):
             return False
         try:
-            screenshot = capture_viewport({})
-            image_url = screenshot.pop("_image_data_url")
-            self._session.add_viewport_images([image_url], post_action=True)
+            screenshots = (
+                [load_png_image(path) for path in self._review_frames]
+                if self._review_frames else [capture_viewport({})]
+            )
+            image_urls = [image.pop("_image_data_url") for image in screenshots]
+            self._session.add_viewport_images(image_urls, post_action=True)
         except Exception as error:
             self._visual_check_failed = True
             self._append("System", f"Visual check could not capture the viewport: {error}")
             return False
         self._append(
             "FreeCAD",
-            f"Visual check: captured {screenshot['width']}×{screenshot['height']} PNG",
+            f"Visual check: prepared {len(screenshots)} FreeCAD viewport PNG image(s)",
         )
         self._viewport_sent_this_turn = True
         self._next_request_review = True
@@ -496,6 +508,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._visual_change_this_turn = False
         self._viewport_sent_this_turn = False
         self._visual_check_failed = False
+        self._review_frames = []
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")

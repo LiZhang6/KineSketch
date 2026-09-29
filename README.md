@@ -137,8 +137,11 @@ run on the GUI thread.
 ### Experimental visual check
 
 Select **Visual check after actions (experimental)** in the Agent panel to send
-one viewport screenshot to the configured model after a successful action turn.
-The model receives a PNG as an OpenAI-compatible `image_url` data URI and returns
+viewport images to the configured model after a successful action turn. For a
+slider-crank run with an exported MP4, it uses two already verified FreeCAD
+viewport frames from the start and middle of the video; other actions use the
+current 3D view. Blank screenshots are rejected rather than sent to the model.
+The model receives PNGs as OpenAI-compatible `image_url` data URIs and returns
 a visual review without access to CAD tools in that review request. The checkbox
 is off by default and its state is saved in local Qt settings. You can also ask
 the agent to call `capture_viewport` when you want a screenshot inspected during
