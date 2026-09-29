@@ -9,6 +9,8 @@ import socket
 import io
 import time
 import ssl
+import math
+import re
 from contextlib import contextmanager
 from http.client import HTTPConnection, HTTPSConnection, HTTPException, HTTPResponse
 from dataclasses import dataclass, replace
@@ -79,6 +81,9 @@ class AgentConfig:
     provider: str = "compatible"
     connection_attempts: int = 3
     reasoning_effort: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    presence_penalty: float | None = None
 
     @property
     def chat_completions_url(self) -> str:
@@ -101,6 +106,28 @@ class AgentClient(Protocol):
         on_reasoning: ContentCallback | None = None,
         on_status: StatusCallback | None = None,
     ) -> dict[str, Any]: ...
+
+
+def _sampling_parameters(config: AgentConfig, *, has_tools: bool) -> dict[str, float]:
+    parameters: dict[str, float] = {}
+    # Only known Qwen3.6 IDs get model-specific defaults; aliases inherit the server's settings.
+    if (config.provider == "compatible" and
+            re.search(r"(?:^|/)qwen3[._-]6(?:[-:/]|$)", config.model.lower())):
+        if config.reasoning_effort == "none" or config.think is False:
+            parameters = {"temperature": 0.7, "top_p": 0.8, "presence_penalty": 1.5}
+        elif has_tools:
+            parameters = {"temperature": 0.6, "top_p": 0.95, "presence_penalty": 0.0}
+        else:
+            parameters = {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 1.5}
+    for name, minimum, maximum in (("temperature", 0, 2), ("top_p", 0, 1), ("presence_penalty", -2, 2)):
+        value = getattr(config, name)
+        if value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or not minimum <= value <= maximum or (name == "top_p" and value == 0)):
+            raise ValueError(f"Invalid sampling parameter: {name}")
+        parameters[name] = float(value)
+    return parameters
 
 
 class OpenAICompatibleClient:
@@ -129,8 +156,8 @@ class OpenAICompatibleClient:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "temperature": 0.2,
         }
+        payload.update(_sampling_parameters(self.config, has_tools=bool(tools)))
         if self.config.conversation_id:
             payload["user"] = self.config.conversation_id
         if self.config.max_tokens is not None:
