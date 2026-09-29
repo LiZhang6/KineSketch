@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
+from .images import ImageAttachment
 
 
 SYSTEM_PROMPT = """You are KineSketch, an assistant embedded in FreeCAD.
@@ -34,12 +36,21 @@ class AgentSession:
     def request_messages(self) -> list[dict[str, Any]]:
         return [self._messages[0], *self._messages[self._turn_start :]]
 
-    def begin(self, user_text: str, document_context: str) -> None:
+    def begin(self, user_text: str, document_context: str,
+              image: ImageAttachment | None = None) -> None:
         self._tool_rounds = 0
         self._trim_history()
         self._turn_start = len(self._messages)
         content = f"Current FreeCAD document:\n{document_context}\n\nUser request:\n{user_text}"
-        self._messages.append({"role": "user", "content": content})
+        if image is None:
+            self._messages.append({"role": "user", "content": content})
+        else:
+            self._messages.append({"role": "user", "content": [
+                {"type": "text", "text": content},
+                {"type": "image_url", "image_url": {
+                    "url": image.data_url, "detail": "high",
+                }},
+            ]})
 
     def accept_assistant(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         stored: dict[str, Any] = {
@@ -72,3 +83,15 @@ class AgentSession:
     def _trim_history(self) -> None:
         if len(self._messages) > 30:
             self._messages = [self._messages[0], *self._messages[-24:]]
+
+    def cancel_turn(self) -> None:
+        """Close unfinished tool calls without claiming they were executed."""
+        turn = self._messages[self._turn_start:]
+        completed = {item.get("tool_call_id") for item in turn if item["role"] == "tool"}
+        for item in turn:
+            for call in item.get("tool_calls", []):
+                if call["id"] not in completed:
+                    self.add_tool_result(call["id"], json.dumps({
+                        "ok": False, "error": "Cancelled by user; action not executed.",
+                    }))
+        self._messages.append({"role": "assistant", "content": "Conversation stopped by user."})

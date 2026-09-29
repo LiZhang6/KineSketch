@@ -110,6 +110,21 @@ the system-OpenSSH tunnel while keeping the UI independent from the transport.
 
 ## Agent Tools
 
+### Image Input
+
+Use **Attach image** in the agent panel to select one PNG, JPEG or WebP file
+(up to 10 MiB), optionally add text, then press **Send**. The filename appears
+beside the attachment button; **Remove image** discards it before sending.
+Images are sent as base64 `image_url` content alongside the text to your
+configured remote endpoint, including through the SSH tunnel. Only attach
+images you intend to upload. Attachment data is not saved to Qt settings.
+
+The remote model must support vision and multimodal Chat Completions messages
+with data URLs. There is no local vision model or silent text-only fallback.
+Include readable dimensions and units; an unscaled photo cannot establish exact
+sizes. **Clear** removes local image attachments and conversation history, but
+does not delete data already retained by the remote service.
+
 The initial agent can:
 
 - inspect active document objects and the current selection;
@@ -123,6 +138,13 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
+
+Use **Stop** to end the current turn immediately, interrupt its HTTP connection,
+and discard queued tools and late responses. You can send a new message without
+waiting for background connection cleanup. Completed CAD changes are preserved;
+a native geometry operation already running on the GUI thread cannot be safely
+interrupted. Disconnecting does not guarantee the server stops inference. The
+button is disabled when idle; there is no resume action.
 
 ## Build
 

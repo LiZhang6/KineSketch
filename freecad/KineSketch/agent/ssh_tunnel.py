@@ -8,7 +8,9 @@ import shutil
 import socket
 import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
+from .cancellation import RequestCancellation
 
 
 class SSHTunnelError(RuntimeError):
@@ -28,12 +30,14 @@ class SSHConfig:
 class SSHTunnel:
     """Forward a random local TCP port through the system OpenSSH client."""
 
-    def __init__(self, config: SSHConfig, remote_host: str, remote_port: int) -> None:
+    def __init__(self, config: SSHConfig, remote_host: str, remote_port: int,
+                 cancellation: RequestCancellation | None = None) -> None:
         self.config = config
         self.remote_host = remote_host
         self.remote_port = remote_port
         self.local_port: int | None = None
         self._process: subprocess.Popen[str] | None = None
+        self._cancellation = cancellation
 
     def __enter__(self) -> SSHTunnel:
         self.open()
@@ -43,6 +47,8 @@ class SSHTunnel:
         self.close()
 
     def open(self) -> None:
+        if self._cancellation is not None:
+            self._cancellation.check()
         if self._process is not None:
             return
         self._validate()
@@ -98,7 +104,15 @@ class SSHTunnel:
             raise SSHTunnelError(f"Cannot start OpenSSH: {error}") from error
 
         try:
-            self._wait_until_ready(process, local_port)
+            def interrupt():
+                if process.poll() is None:
+                    process.terminate()
+
+            binding = self._cancellation.bind(interrupt) if self._cancellation is not None else nullcontext()
+            with binding:
+                self._wait_until_ready(process, local_port)
+                if self._cancellation is not None:
+                    self._cancellation.check()
         except Exception:
             _stop_process(process)
             raise
@@ -115,6 +129,8 @@ class SSHTunnel:
     def _wait_until_ready(self, process: subprocess.Popen[str], port: int) -> None:
         deadline = time.monotonic() + self.config.timeout
         while time.monotonic() < deadline:
+            if self._cancellation is not None:
+                self._cancellation.check()
             if process.poll() is not None:
                 detail = process.stderr.read().strip() if process.stderr else ""
                 message = detail or f"OpenSSH exited with code {process.returncode}"
