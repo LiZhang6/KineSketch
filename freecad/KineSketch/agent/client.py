@@ -25,6 +25,17 @@ class AgentClientError(RuntimeError):
     """Raised when the configured model endpoint cannot return a valid reply."""
 
 
+class AgentEmptyResponseError(AgentClientError):
+    """A completed response has no executable action or final answer."""
+
+    def __init__(self, finish_reason=None, reasoning_characters: int = 0):
+        super().__init__(
+            "Model returned no text or tool calls "
+            f"(finish_reason={finish_reason or 'unknown'}, reasoning_characters={reasoning_characters}). "
+            "Check model tool support, output limits, and the server's chat template."
+        )
+
+
 ContentCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 
@@ -55,6 +66,7 @@ class AgentConfig:
     tool_choice: str | dict[str, Any] = "auto"
     provider: str = "compatible"
     connection_attempts: int = 3
+    reasoning_effort: str | None = None
 
     @property
     def chat_completions_url(self) -> str:
@@ -115,6 +127,8 @@ class OpenAICompatibleClient:
             payload["reasoning_format"] = "deepseek-style"
         elif self.config.think is not None:
             payload["think"] = self.config.think
+        if self.config.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.config.reasoning_effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = self.config.tool_choice if tool_choice is None else tool_choice
@@ -151,6 +165,13 @@ class OpenAICompatibleClient:
             raise AgentClientError(
                 f"Model endpoint returned HTTP {error.code}: {detail}"
             ) from error
+        except TimeoutError as error:
+            if cancellation is not None:
+                cancellation.check()
+            raise AgentClientError(
+                "Model connection/response timed out. The request was not resent; "
+                f"the server may still be working (response timeout: {self.config.timeout:g}s)."
+            ) from error
         except (URLError, OSError, HTTPException) as error:
             if cancellation is not None:
                 cancellation.check()
@@ -168,9 +189,8 @@ class OpenAICompatibleClient:
         if isinstance(reasoning, str) and on_reasoning is not None:
             on_reasoning(reasoning)
         if not message.get("content") and not message.get("tool_calls"):
-            raise AgentClientError(
-                "Model returned no text or tool calls; increase the endpoint's output token limit"
-            )
+            raise AgentEmptyResponseError(result["choices"][0].get("finish_reason"),
+                                          len(reasoning) if isinstance(reasoning, str) else 0)
         return message
 
 
@@ -349,6 +369,8 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
     content_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     received_done = False
+    finish_reason = None
+    reasoning_characters = 0
 
     try:
         for raw_line in response:
@@ -378,6 +400,8 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
 
             content = delta.get("content")
             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, str):
+                reasoning_characters += len(reasoning)
             if isinstance(reasoning, str) and reasoning and on_reasoning is not None:
                 on_reasoning(reasoning)
             if isinstance(content, str) and content:
@@ -388,7 +412,8 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
                 raise AgentClientError("Model endpoint returned invalid tool-call deltas")
             for call_delta in call_deltas:
                 _merge_tool_call_delta(tool_calls, call_delta)
-            if choices[0].get("finish_reason") == "length":
+            finish_reason = choices[0].get("finish_reason") or finish_reason
+            if finish_reason == "length":
                 raise AgentClientError("Model reached its output token limit; the reply is incomplete")
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AgentClientError("Model endpoint returned an invalid SSE stream") from error
@@ -405,9 +430,7 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     if not message["content"] and not tool_calls:
-        raise AgentClientError(
-            "Model returned no text or tool calls; increase the endpoint's output token limit"
-        )
+        raise AgentEmptyResponseError(finish_reason, reasoning_characters)
     return message
 
 

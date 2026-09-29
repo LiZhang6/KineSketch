@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from .images import ImageAttachment
 
@@ -19,7 +20,13 @@ other tools. Use the internal object name from a successful creation result for
 later operations. Correct recoverable tool errors using the returned results and
 retry; report any remaining failure accurately. If no supplied tool supports the
 requested operation, explain that limitation instead of claiming it was performed.
-For a rail-guided, zero-offset slider-crank with a base, crank, connecting rod
+For creation requests, call modeling tools instead of promising future work.
+For images, identify supported geometry first. Use readable dimensions; when
+dimensions are missing, choose feasible defaults in millimetres and report those
+assumptions. Do not claim exact reproduction of an unscaled image. Reasoning text
+and code blocks are never executed CAD operations."""
+
+SLIDER_CRANK_PROMPT = """For a rail-guided, zero-offset slider-crank with a base, crank, connecting rod
 and slider, translate the user's text into your own explicit additive feature
 plan and call build_slider_crank_from_plan. The tool builds exactly the boxes
 and cylinders you specify; it does not load prebuilt CAD parts. Use a base plate,
@@ -48,6 +55,20 @@ capture_viewport. Its image arrives in the next user message. Describe only
 what is visible and distinguish visual observations from CAD/solver tool results."""
 
 
+CREATION_TOOLS = frozenset({"create_box", "create_cylinder", "build_slider_crank_from_plan"})
+
+
+def _requests_creation(text: str) -> bool:
+    lowered = text.lower()
+    if any(word in lowered for word in ("如何", "怎么", "怎样", "how to", "how do", "how can")):
+        return False
+    if re.search(r"(?:不要|无需|别|不需要)\s*(?:生成|创建|构建|建模|制作)|"
+                 r"(?:do not|don't|never)\s+(?:create|generate|build|model)", lowered):
+        return False
+    return bool(re.search(r"生成|创建|构建|建模|制作|装配|仿真|演示|\b(?:create|generate|build|simulate)\b|"
+                          r"(?:^|please\s+)model\s|\bmodel\s+(?:a|an|the|this|that)\b", lowered))
+
+
 VIEWPORT_TOOL_PROMPT = (
     "FreeCAD viewport screenshot requested by capture_viewport. Inspect this "
     "image for the current task. Report visible evidence and uncertainty; use "
@@ -73,6 +94,12 @@ class AgentSession:
         ]
         self._turn_start = 1
         self._slider_crank_turn = False
+        self._creation_requested = False
+        self._creation_attempted = False
+        self._creation_succeeded = False
+        self._missing_tool_retry = False
+        self._has_image = False
+        self.creation_error = ""
 
     @property
     def messages(self) -> list[dict[str, Any]]:
@@ -80,25 +107,99 @@ class AgentSession:
 
     @property
     def request_messages(self) -> list[dict[str, Any]]:
-        return [self._messages[0], *self._messages[self._turn_start :]]
+        prompt = SYSTEM_PROMPT
+        if self._slider_crank_turn:
+            prompt += "\n\n" + SLIDER_CRANK_PROMPT
+        return [{"role": "system", "content": prompt}, *self._messages[self._turn_start :]]
 
     @property
     def tool_choice(self) -> str | dict[str, Any]:
         if self._slider_crank_turn and self._tool_rounds == 0:
             return {"type": "function", "function": {"name": "build_slider_crank_from_plan"}}
+        if (self._creation_requested and not self._creation_attempted
+                and (self._tool_rounds == 0 or self._missing_tool_retry)):
+            return "required"
         return "auto"
+
+    def request_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        selected = self.tool_choice
+        if isinstance(selected, dict):
+            name = selected["function"]["name"]
+            matches = [tool for tool in tools if tool.get("function", {}).get("name") == name]
+            if not matches:
+                raise ValueError(f"Required modeling tool is unavailable: {name}")
+            return matches
+        if self._slider_crank_turn or (self._has_image and self._creation_requested):
+            matches = list(tools)
+        else:
+            matches = [tool for tool in tools if tool.get("function", {}).get("name")
+                       != "build_slider_crank_from_plan"]
+        if selected == "required" and not any(
+                tool.get("function", {}).get("name") in CREATION_TOOLS for tool in matches):
+            raise ValueError("No modeling tools are available for this request")
+        return matches
+
+    @property
+    def creation_requested(self) -> bool:
+        return self._creation_requested
+
+    @property
+    def creation_attempted(self) -> bool:
+        return self._creation_attempted
+
+    @property
+    def creation_succeeded(self) -> bool:
+        return self._creation_succeeded
+
+    @property
+    def creation_summary(self) -> str:
+        turn = self._messages[self._turn_start:]
+        names = {call.get("id"): call.get("function", {}).get("name")
+                 for message in turn for call in message.get("tool_calls", [])}
+        lines = []
+        for message in turn:
+            name = names.get(message.get("tool_call_id"))
+            if message.get("role") != "tool" or name not in CREATION_TOOLS:
+                continue
+            try:
+                result = json.loads(message["content"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(result, dict) and result.get("ok") is True:
+                target = result.get("label") or result.get("name") or result.get("run_directory") or "success"
+                lines.append(f"{name}: {target}")
+        return "Modeling tools completed successfully:\n" + "\n".join(lines)
+
+    def retry_missing_tool(self) -> bool:
+        if not self._creation_requested or self._creation_attempted or self._missing_tool_retry:
+            return False
+        self._missing_tool_retry = True
+        self._messages.append({"role": "user", "content": (
+            "No modeling tool has run and no model has been created. Call an available "
+            "modeling tool now with valid arguments for the original request. Use feasible "
+            "defaults for unspecified dimensions and disclose them. Do not just promise "
+            "to create a model. If the requested shape is unsupported, explain the limitation."
+        )})
+        return True
 
     def begin(self, user_text: str, document_context: str,
               image: ImageAttachment | None = None) -> None:
         self._tool_rounds = 0
         lowered = user_text.lower()
+        self._creation_requested = _requests_creation(user_text)
+        self._creation_attempted = False
+        self._creation_succeeded = False
+        self._missing_tool_retry = False
+        self._has_image = image is not None
+        self.creation_error = ""
         self._slider_crank_turn = (
             ("曲柄滑块" in user_text or "slider-crank" in lowered or "slider crank" in lowered)
-            and any(word in lowered for word in
-                    ("创建", "生成", "构建", "演示", "装配", "仿真", "build", "create", "simulate"))
+            and self._creation_requested
             and not any(word in lowered for word in ("重播", "重新播放", "回放", "replay"))
         )
         self._trim_history()
+        if any(word in lowered for word in ("重播", "重新播放", "回放", "replay")):
+            self._creation_requested = False
         self._turn_start = len(self._messages)
         content = f"Current FreeCAD document:\n{document_context}\n\nUser request:\n{user_text}"
         if image is None:
@@ -125,6 +226,18 @@ class AgentSession:
         return tool_calls
 
     def add_tool_result(self, call_id: str, result: str) -> None:
+        call = next((call for message in reversed(self._messages[self._turn_start:])
+                     for call in message.get("tool_calls", []) if call.get("id") == call_id), None)
+        if call is not None and call.get("function", {}).get("name") in CREATION_TOOLS:
+            self._creation_attempted = True
+            try:
+                data = json.loads(result)
+            except (TypeError, json.JSONDecodeError):
+                data = {}
+            succeeded = isinstance(data, dict) and data.get("ok") is True
+            self._creation_succeeded |= succeeded
+            if not succeeded:
+                self.creation_error = str(data.get("error", "Modeling tool failed")) if isinstance(data, dict) else "Invalid modeling result"
         self._messages.append(
             {"role": "tool", "tool_call_id": call_id, "content": result}
         )
@@ -150,6 +263,12 @@ class AgentSession:
     def clear(self) -> None:
         self._tool_rounds = 0
         self._slider_crank_turn = False
+        self._creation_requested = False
+        self._creation_attempted = False
+        self._creation_succeeded = False
+        self._missing_tool_retry = False
+        self._has_image = False
+        self.creation_error = ""
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._turn_start = 1
 
@@ -173,3 +292,4 @@ class AgentSession:
                     }))
         self._messages.append({"role": "assistant", "content": "Conversation stopped by user."})
         self._slider_crank_turn = False
+        self._creation_requested = False

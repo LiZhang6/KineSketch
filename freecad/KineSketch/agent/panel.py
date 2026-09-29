@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -14,10 +15,10 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
-from .client import AgentClientError, AgentConfig, create_agent_client, validate_access_token
+from .client import AgentClientError, AgentEmptyResponseError, AgentConfig, create_agent_client, validate_access_token
 from .cancellation import RequestCancellation, RequestCancelled
 from .images import ImageAttachment, load_image
-from .session import AgentSession
+from .session import AgentSession, CREATION_TOOLS
 from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
@@ -34,17 +35,17 @@ class _RequestWorker(QtCore.QObject):
     finished = QtCore.Signal()
 
     def __init__(self, config: AgentConfig, messages: list[dict[str, Any]],
-                 request_id: int = 0) -> None:
+                 request_id: int = 0, tools: list[dict[str, Any]] | None = None) -> None:
         super().__init__()
         self._config = config
         self._messages = messages
+        self._tools = TOOL_DEFINITIONS if tools is None else tools
         self.request_id = request_id
         self.cancellation = RequestCancellation()
         self._stream_parts: list[str] = []
         self._stream_size = 0
         self._last_stream_emit = 0.0
         self._reasoning_parts: list[str] = []
-        self._reasoning_size = 0
 
     def _emit_status(self, status: str) -> None:
         self.cancellation.check()
@@ -52,10 +53,10 @@ class _RequestWorker(QtCore.QObject):
 
     def _emit_reasoning(self, content: str) -> None:
         self.cancellation.check()
-        excerpt = content[:max(0, REASONING_PREVIEW_LIMIT - self._reasoning_size)]
-        if excerpt:
-            self._reasoning_parts.append(excerpt)
-            self._reasoning_size += len(excerpt)
+        if content:
+            self._reasoning_parts[:] = [
+                ("".join(self._reasoning_parts) + content)[-REASONING_PREVIEW_LIMIT:]
+            ]
         if time.monotonic() - self._last_stream_emit >= 0.075:
             self._flush_content()
 
@@ -85,7 +86,8 @@ class _RequestWorker(QtCore.QObject):
             self.cancellation.check()
             reply = create_agent_client(self._config).complete(
                 self._messages,
-                TOOL_DEFINITIONS,
+                self._tools,
+                tool_choice=self._config.tool_choice,
                 on_content=self._emit_content,
                 on_reasoning=self._emit_reasoning,
                 on_status=self._emit_status,
@@ -93,6 +95,11 @@ class _RequestWorker(QtCore.QObject):
             )
             self.cancellation.check()
         except RequestCancelled:
+            return
+        except AgentEmptyResponseError as error:
+            if not self.cancellation.cancelled:
+                self._flush_content()
+                self.completed.emit(self.request_id, {"content": None, "_empty_response_error": str(error)})
             return
         except Exception as error:
             if not self.cancellation.cancelled:
@@ -129,11 +136,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._reply_handled = False
         self._tools_running = False
         self._pending_tools: deque[dict[str, Any]] = deque()
+        self._pending_viewport_images: list[str] = []
         self._tool_step_scheduled = False
         self._streaming_reply_started = False
         self._stream_parts: list[str] = []
         self._reasoning_parts: list[str] = []
-        self._reasoning_size = 0
+        self._reasoning_text = ""
         self._last_connection = None
         self._profile_tokens: dict[str, str] = {}
         self._provider = "compatible"
@@ -224,6 +232,20 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         form.addRow(App.Qt.translate("KineSketch", "Endpoint"), self.endpoint_edit)
         form.addRow(App.Qt.translate("KineSketch", "Model"), self.model_combo)
         form.addRow(App.Qt.translate("KineSketch", "Access token"), self.api_key_edit)
+        self.max_tokens_edit = QtWidgets.QSpinBox(connection)
+        self.max_tokens_edit.setRange(128, 32768)
+        self.max_tokens_edit.setValue(int(self._settings.value("max_tokens", 8192)))
+        form.addRow(App.Qt.translate("KineSketch", "Output tokens"), self.max_tokens_edit)
+        self.timeout_edit = QtWidgets.QSpinBox(connection)
+        self.timeout_edit.setRange(15, 600)
+        self.timeout_edit.setSuffix(" s")
+        self.timeout_edit.setValue(int(self._settings.value("timeout", 300)))
+        form.addRow(App.Qt.translate("KineSketch", "Response timeout"), self.timeout_edit)
+        self.thinking_combo = QtWidgets.QComboBox(connection)
+        for label, value in (("Default", None), ("Off", "none"), ("Low", "low"), ("High", "high")):
+            self.thinking_combo.addItem(App.Qt.translate("KineSketch", label), value)
+        self.thinking_combo.setCurrentIndex(max(0, self.thinking_combo.findData(self._settings.value("reasoning_effort", None))))
+        form.addRow(App.Qt.translate("KineSketch", "Thinking"), self.thinking_combo)
 
         ssh_connection = QtWidgets.QGroupBox(
             App.Qt.translate("KineSketch", "SSH key tunnel"), container
@@ -402,8 +424,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._busy:
             return
         self._save_profile()
+        self._settings.setValue("max_tokens", self.max_tokens_edit.value())
         self._provider = str(self.provider_combo.currentData())
         cloud = self._provider.startswith("stepfun")
+        self.thinking_combo.model().item(1).setEnabled(not cloud)
+        if cloud and self.thinking_combo.currentData() == "none":
+            self.thinking_combo.setCurrentIndex(0)
         default_endpoint = ("https://api.stepfun.ai/v1" if self._provider == "stepfun-international"
                             else "https://api.stepfun.com/v1") if cloud else "http://127.0.0.1:18789/v1"
         prefix = f"profiles/{self._provider}/"
@@ -529,6 +555,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._provider == "compatible":
             self._settings.setValue("endpoint", endpoint)
             self._settings.setValue("model", model)
+        self._settings.setValue("max_tokens", self.max_tokens_edit.value())
+        self._settings.setValue("timeout", self.timeout_edit.value())
+        self._settings.setValue("reasoning_effort", self.thinking_combo.currentData())
         if self._provider == "compatible":
             self._settings.setValue("ssh/enabled", self.ssh_connection.isChecked())
         self._settings.setValue("ssh/host", self.ssh_host_edit.text().strip())
@@ -541,8 +570,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._session.clear()
             self._conversation_id = self._new_conversation_id()
         self._last_connection = connection
-        self._reasoning_size = 0
+        self._reasoning_text = ""
         self._reasoning_parts.clear()
+        self._pending_viewport_images.clear()
         self.reasoning_view.clear()
         self.reasoning_group.hide()
         self.reply_view.clear()
@@ -559,6 +589,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _request_model(self, status_message: str | None = None) -> None:
         if self._stopped:
             return
+        try:
+            tools = self._session.request_tools(TOOL_DEFINITIONS)
+        except ValueError as error:
+            self._handle_error(str(error))
+            return
         ssh_config = None
         if self.ssh_connection.isChecked():
             ssh_config = SSHConfig(
@@ -573,6 +608,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             conversation_id=self._conversation_id,
             ssh=ssh_config,
             provider=self._provider,
+            tool_choice=self._session.tool_choice,
+            max_tokens=self.max_tokens_edit.value(),
+            timeout=self.timeout_edit.value(),
+            reasoning_effort=self.thinking_combo.currentData(),
         )
         self._set_busy(True)
         self._set_status(
@@ -585,11 +624,12 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.reply_view.clear()
         self.reply_group.hide()
         self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (streaming)"))
+        self.reasoning_group.setTitle(App.Qt.translate("KineSketch", "Thinking excerpt (live)"))
         self._reply_handled = False
         self._request_id += 1
 
         thread = QtCore.QThread(self)
-        worker = _RequestWorker(config, self._session.request_messages, self._request_id)
+        worker = _RequestWorker(config, self._session.request_messages, self._request_id, tools=tools)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.content_delta.connect(self._receive_content_delta)
@@ -615,10 +655,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _receive_reasoning_delta(self, request_id: int, content: str) -> None:
         if request_id != self._request_id or self._stopped:
             return
-        excerpt = content[:max(0, REASONING_PREVIEW_LIMIT - self._reasoning_size)]
-        if excerpt:
-            self._reasoning_size += len(excerpt)
-            self._reasoning_parts.append(excerpt)
+        if content:
+            self._reasoning_parts[:] = [
+                ("".join(self._reasoning_parts) + content)[-REASONING_PREVIEW_LIMIT:]
+            ]
             if not self._stream_timer.isActive():
                 self._stream_timer.start()
         if not self._streaming_reply_started and not self._stream_parts:
@@ -646,7 +686,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._flush_stream()
         self._reply_handled = True
         try:
-            tool_calls = self._session.accept_assistant(message)
+            empty_error = message.get("_empty_response_error")
+            tool_calls = [] if empty_error else self._session.accept_assistant(message)
             self.reply_group.hide()
             if tool_calls:
                 self._append_unstreamed_content(message)
@@ -659,7 +700,29 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 self._tools_running = True
                 self._schedule_tool_step()
                 return
-            self._append_unstreamed_content(message)
+            if self._session.retry_missing_tool():
+                self._continue_after_finish = True
+                self._set_status("Requesting modeling tool call...", "busy", busy=True)
+                return
+            if self._session.creation_requested and not self._session.creation_succeeded:
+                if self._session.creation_attempted:
+                    detail = self._session.creation_error or "No modeling tool completed successfully."
+                    self._append("System", f"Model creation failed: {detail}")
+                else:
+                    self._append("System", "The model did not call a modeling tool after one retry. No CAD model was created.")
+                    if message.get("content"):
+                        self._append("Agent response (not executed)", str(message["content"]))
+                self._set_status("Model not created", "error")
+                return
+            if empty_error:
+                if self._session.creation_succeeded:
+                    self._append("KineSketch", self._session.creation_summary)
+                else:
+                    self._handle_error(str(empty_error))
+                    return
+            else:
+                self._append_unstreamed_content(message)
+            self.reasoning_group.setTitle(App.Qt.translate("KineSketch", "Thinking excerpt (complete)"))
             self._set_status(
                 App.Qt.translate("KineSketch", "Answer complete"), "ready"
             )
@@ -688,13 +751,33 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             if self._pending_tools:
                 call = self._pending_tools.popleft()
                 result = execute_tool_call(call)
+                name = str(call.get("function", {}).get("name", ""))
+                try:
+                    data = json.loads(result)
+                except (TypeError, json.JSONDecodeError):
+                    data = None
+                if isinstance(data, dict):
+                    image = data.pop("_image_data_url", None)
+                    if name == "capture_viewport" and data.get("ok") is True and isinstance(image, str):
+                        self._pending_viewport_images.append(image)
+                        self._pending_viewport_images[:] = self._pending_viewport_images[-2:]
+                    result = json.dumps(data, ensure_ascii=False)
+                    if name in CREATION_TOOLS:
+                        target = data.get("label") or data.get("name") or data.get("run_directory")
+                        self._append("Tool", f"{name}: " + (
+                            f"created {target or 'model'}" if data.get("ok") is True
+                            else str(data.get("error", "Operation failed"))))
                 self._session.add_tool_result(str(call.get("id", "")), result)
                 self._schedule_tool_step()
                 return
+            if self._pending_viewport_images:
+                self._session.add_viewport_images(self._pending_viewport_images, post_action=False)
+                self._pending_viewport_images.clear()
             self._session.continue_after_tools()
             self._continue_after_finish = True
         except Exception as error:
             self._pending_tools.clear()
+            self._pending_viewport_images.clear()
             self._append("System", str(error))
             self._set_status(App.Qt.translate("KineSketch", "Agent action failed"), "error")
         self._tools_running = False
@@ -714,9 +797,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._stream_timer.stop()
         self._stream_parts.clear()
         self._reasoning_parts.clear()
+        self.reasoning_group.setTitle(App.Qt.translate("KineSketch", "Thinking excerpt (stopped)"))
         self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (stopped)"))
         self._request_id += 1
         self._pending_tools.clear()
+        self._pending_viewport_images.clear()
         self._tools_running = False
         self._tool_step_scheduled = False
         self._continue_after_finish = False
@@ -749,7 +834,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         if self._reasoning_parts:
             self.reasoning_group.show()
-            self._append_preview(self.reasoning_view, "".join(self._reasoning_parts))
+            self._reasoning_text = (
+                self._reasoning_text + "".join(self._reasoning_parts)
+            )[-REASONING_PREVIEW_LIMIT:]
+            self._replace_preview(self.reasoning_view, self._reasoning_text)
             self._reasoning_parts.clear()
         if not self._stream_parts:
             return
@@ -759,6 +847,14 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self.reply_group.show()
             self._streaming_reply_started = True
         self._append_preview(self.reply_view, content)
+
+    @staticmethod
+    def _replace_preview(view, text: str) -> None:
+        scrollbar = view.verticalScrollBar()
+        previous = scrollbar.value()
+        follow = previous >= scrollbar.maximum() - 24
+        view.setPlainText(text)
+        scrollbar.setValue(scrollbar.maximum() if follow else previous)
 
     @staticmethod
     def _append_preview(view, text: str) -> None:
@@ -776,6 +872,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         self._flush_stream()
         self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (incomplete)"))
+        self.reasoning_group.setTitle(App.Qt.translate("KineSketch", "Thinking excerpt (incomplete)"))
         self._reply_handled = True
         self._append("System", message)
         self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
@@ -808,8 +905,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         self._session.clear()
         self._stream_timer.stop()
+        self._pending_viewport_images.clear()
         self._stream_parts.clear()
         self._reasoning_parts.clear()
+        self._reasoning_text = ""
         self.reasoning_view.clear()
         self.reasoning_group.hide()
         self.reply_view.clear()
