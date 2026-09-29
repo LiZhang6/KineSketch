@@ -28,7 +28,16 @@ and code blocks are never executed CAD operations. For follow-ups such as Contin
 use the prior request and successful tool results to resume unfinished work.
 Do not recreate completed objects unless the user explicitly asks for duplicates.
 Use the current document's dimensions and placement rather than guessing them.
-A box's x/y/z is its minimum corner, not the centre of its bottom face."""
+A box's x/y/z is its minimum corner, not the centre of its bottom face.
+Use boolean_operation for real cuts and fusions: a cylinder adds material, not a
+hole. For a rectangular frame, cut a smaller box through an outer box, then cut
+cylinders through the corner pads for holes. Cutting tools must extend beyond
+both faces. Use each successful result's name as the next cut's base. Operands
+are preserved and hidden, not deleted; do not confuse hidden dependencies with
+unwanted duplicate geometry. Do not claim objects were deleted without a tool.
+Choose one supported construction plan and call tools. Do not keep restating
+the same plan or reasoning about a capability that the supplied tools support.
+If a necessary operation is genuinely unsupported, explain it once and stop."""
 
 SLIDER_CRANK_PROMPT = """For a rail-guided, zero-offset slider-crank with a base, crank, connecting rod
 and slider, translate the user's text into your own explicit additive feature
@@ -59,7 +68,7 @@ capture_viewport. Its image arrives in the next user message. Describe only
 what is visible and distinguish visual observations from CAD/solver tool results."""
 
 
-CREATION_TOOLS = frozenset({"create_box", "create_cylinder", "build_slider_crank_from_plan"})
+CREATION_TOOLS = frozenset({"create_box", "create_cylinder", "boolean_operation", "build_slider_crank_from_plan"})
 HISTORY_TURNS = 8
 HISTORY_CHARACTERS = 60000
 

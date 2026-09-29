@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Callable
 
 import FreeCAD as App
@@ -89,6 +90,34 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "z": {"type": "number", "default": 0},
                 },
                 "required": ["radius", "height"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "boolean_operation",
+            "description": (
+                "Create a parametric boolean result from two existing solid objects. "
+                "cut subtracts tool_name from base_name to make real holes or cavities; "
+                "fuse unites solids that touch along a face or overlap into one solid. "
+                "Use exact internal object names from tool results, not labels. "
+                "For a rectangular frame, cut a smaller box through the larger box; "
+                "for a round hole, cut a cylinder extending beyond both faces. "
+                "Creating a cylinder alone ADDS material and never makes a hole. "
+                "Source objects are retained as editable dependencies and hidden, not deleted. "
+                "Use the returned result name as the base for subsequent cuts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["cut", "fuse"]},
+                    "base_name": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "label": {"type": "string"},
+                },
+                "required": ["operation", "base_name", "tool_name"],
                 "additionalProperties": False,
             },
         },
@@ -228,6 +257,13 @@ def document_summary() -> str:
             placement = obj.Placement
             item["position_mm"] = [placement.Base.x, placement.Base.y, placement.Base.z]
             item["rotation_quaternion_xyzw"] = list(placement.Rotation.Q)
+        if App.GuiUp:
+            item["visible"] = bool(obj.ViewObject.Visibility)
+        for name in ("Base", "Tool"):
+            if name in properties:
+                source = getattr(obj, name)
+                if source is not None and isinstance(getattr(source, "Name", None), str):
+                    item[name.lower()] = source.Name
         objects.append(item)
     return json.dumps(
         {"name": document.Name, "objects": objects, "selected": selected_names},
@@ -249,6 +285,7 @@ def execute_tool_call(tool_call: dict[str, Any]) -> str:
     handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
         "create_box": _create_box,
         "create_cylinder": _create_cylinder,
+        "boolean_operation": _boolean_operation,
         "set_placement": _set_placement,
         "fit_view": _fit_view,
         "capture_viewport": _capture_viewport,
@@ -376,6 +413,63 @@ def _create_cylinder(arguments: dict[str, Any]) -> dict[str, Any]:
         document.abortTransaction()
         raise
     return {"ok": True, "name": obj.Name, "label": obj.Label}
+
+
+def _boolean_operation(arguments: dict[str, Any]) -> dict[str, Any]:
+    operation = arguments["operation"]
+    if operation not in ("cut", "fuse"):
+        raise ValueError("operation must be cut or fuse")
+    document = App.ActiveDocument
+    if document is None:
+        raise ValueError("No active document")
+    sources = []
+    for key in ("base_name", "tool_name"):
+        name = arguments[key]
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"{key} must be a non-empty internal object name")
+        obj = document.getObject(name)
+        if obj is None:
+            raise ValueError(f"Object not found by internal name: {name}")
+        if (not hasattr(obj, "Shape") or obj.Shape.isNull() or not obj.Shape.isValid()
+                or not obj.Shape.Solids):
+            raise ValueError(f"Object is not a valid solid: {name}")
+        sources.append(obj)
+    base, tool = sources
+    if base is tool:
+        raise ValueError("base_name and tool_name must refer to different objects")
+    visibility = [(obj, obj.ViewObject.Visibility) for obj in sources] if App.GuiUp else []
+    document.openTransaction(f"KineSketch Agent: Boolean {operation}")
+    try:
+        result = document.addObject("Part::Cut" if operation == "cut" else "Part::Fuse", "AgentBoolean")
+        result.Label = _label(arguments, "Agent Cut" if operation == "cut" else "Agent Fuse")
+        result.Base = base
+        result.Tool = tool
+        document.recompute()
+        shape = result.Shape
+        volume = float(shape.Volume)
+        if shape.isNull() or not shape.isValid() or not shape.Solids or not math.isfinite(volume) or volume <= 0:
+            raise ValueError("Boolean operation produced an empty or invalid solid; check operand placement")
+        removed = float(base.Shape.Volume) - volume
+        if operation == "cut" and removed <= max(1e-7, abs(base.Shape.Volume) * 1e-9):
+            raise ValueError("Cut removed no material; move the cutting solid so it intersects the base")
+        if operation == "fuse" and len(shape.Solids) != 1:
+            raise ValueError("Fuse produced disconnected solids; operands must touch along a face or overlap")
+        if App.GuiUp:
+            base.ViewObject.Visibility = False
+            tool.ViewObject.Visibility = False
+            result.ViewObject.Visibility = True
+        document.commitTransaction()
+    except Exception:
+        document.abortTransaction()
+        for obj, visible in visibility:
+            obj.ViewObject.Visibility = visible
+        raise
+    response = {"ok": True, "name": result.Name, "label": result.Label,
+                "operation": operation, "base_name": base.Name, "tool_name": tool.Name,
+                "volume_mm3": volume, "solid_count": len(shape.Solids)}
+    if operation == "cut":
+        response["removed_volume_mm3"] = removed
+    return response
 
 
 def _set_placement(arguments: dict[str, Any]) -> dict[str, Any]:
