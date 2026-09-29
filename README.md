@@ -11,9 +11,9 @@ KineSketch 是集成在 FreeCAD 中的智能建模助手。用户通过对话面
 
 - **自然语言建模**：创建参数化长方体、圆柱体，调整对象位置与姿态，以及适配视图。几何操作使用 FreeCAD 事务，异常时回滚，完成后可通过 Undo 撤销。
 - **图文交互**：支持文字和 PNG、JPEG、WebP 图片输入，单张图片上限为 10 MiB；图像理解需要模型支持视觉输入。
-- **流式对话与停止**：网络请求在后台线程运行，界面批量刷新回复。点击 `Stop` 可中断连接并丢弃未执行动作，已完成的 CAD 修改保留。
+- **流式对话与停止**：网络请求在后台线程运行，实时预览回复，并单独展示服务端返回的思考片段（每轮最多 2000 字符）；回答全部结束后写入最终答案。点击 `Stop` 可中断连接并丢弃未执行动作，已完成的 CAD 修改保留。
 - **机构装配与仿真**：通过两个独立 Skills 校验零件、建立原生装配、采样运动数据，并输出模型、曲线、报告及真实视口视频。
-- **可替换模型后端**：通过 OpenAI 兼容接口连接 OpenClaw Gateway，由网关管理会话、模型选择和供应商凭据。
+- **可替换模型后端**：通过 OpenAI 兼容接口连接 OpenClaw Gateway 或模型服务，也可选择 StepFun 云端直连；支持模型下拉选择及手工输入模型 ID。
 
 ## 架构与技术实现
 
@@ -69,8 +69,8 @@ flowchart TD
    ```
    C:\Users\<你的用户名>\AppData\Roaming\FreeCAD\<FreeMod版本号>\Mod
    ```
-2. 进入 **KineSketch** 工作台，点击 **Open Agent**。
-3. 填写 `Endpoint`、`Agent` 和 `Access token`。Endpoint 以 `/v1` 结尾，或直接指向 `/chat/completions`。
+2. 进入 **KineSketch** 工作台，点击 **Open Agent**，并新创建一个空白项目文件。
+3. 打开连接设置，选择 `Provider`、`Model`，填写 `Endpoint` 和 `Access token`。Endpoint 以 `/v1` 结尾，或直接指向 `/chat/completions`。
 4. 本项目使用 SSH 隧道连接网关。先配置密钥认证，再在面板中填写服务器地址、端口和用户名。
 
 在提供 `ssh-copy-id` 的终端中执行以下命令，将用户名和主机地址替换为实际值；非默认端口需给连接和公钥安装命令增加 `-p <port>`：
@@ -84,11 +84,21 @@ Windows 自带 OpenSSH 通常不包含 `ssh-copy-id`，可将公钥交由服务�
 
 ```text
 Endpoint: http://127.0.0.1:18789/v1
-Agent:    openclaw/default
+Model:    openclaw/default
 Token:    网关访问令牌
 ```
 
 使用 SSH 时，Endpoint 中的回环地址指向远端服务器上的网关。网关需启用 Chat Completions 端点；底层模型和供应商密钥在网关侧配置。Windows 用户可运行 `build.ps1` 生成 wheel 与源码包。
+
+### StepFun 直连与模型切换
+
+在连接设置中选择 `StepFun`，默认 Endpoint 为 `https://api.stepfun.com/v1`；选择 `StepFun International` 则为 `https://api.stepfun.ai/v1`。直连默认关闭 SSH，在 `Access token` 中自行填写对应平台的 API Key。密钥只保留在当前面板内存，不写入设置文件；不同 Provider 的令牌与连接配置分别维护。
+
+`Model` 可选择 `step-3.5-flash`、`step-3.5-flash-2603`、`step-3.7-flash`、`step-5-preview`，也可手工输入自部署服务的真实模型 ID。模型是否可用以服务端和账号权限为准。3.5 Flash 系列仅支持文本；图片输入可选择 3.7 Flash 或 Step 5 Preview，详见[官方模型说明](https://platform.stepfun.ai/docs/en/guides/developer/reasoning)。通过网关使用 StepFun 时继续选择 OpenAI-compatible / Gateway，填写网关自己的模型 ID 与令牌。
+
+客户端使用 Chat Completions 的 SSE 流，StepFun 请求指定 `reasoning_format: deepseek-style`，同时兼容响应中的 `reasoning_content` 和 `reasoning`；思考内容不作为最终答案，也不加入后续对话上下文。格式依据[官方 API 文档](https://platform.stepfun.ai/docs/en/api-reference/chat/chat-completion-create)。模型不返回思考字段时，只显示实时回复。
+
+状态依次显示 Connecting、Thinking、Receiving response、Applying agent actions 和 Answer complete。连接失败最多尝试 3 次（含首次连接），SSH 和 HTTP 共享剩余重试额度；认证、主机密钥及证书错误不自动重试。请求一旦开始发送，后续断线不重发，避免重复建模。停止或失败时的预览会标为 stopped 或 incomplete，不作为最终答案。切换连接或模型后，下次发送使用新的会话 ID，不转发上一模型的会话上下文。
 
 ### 本地算力与模型服务
 
@@ -96,7 +106,7 @@ Token:    网关访问令牌
 
 云端方案可通过网关连接[阶跃星辰开放平台](https://platform.stepfun.com/)，也可在网关侧配置本地与云端模型路由。部署完成后，应验证流式输出、工具调用、多轮会话和图像输入，并记录真实模型 ID、GPU 型号与请求耗时。
 
-NVIDIA NIM、TensorRT-LLM 目前属于可选部署方案，仓库未直接依赖这些 SDK；StepFun 模型由网关选择，仓库未固定具体型号。
+NVIDIA NIM、TensorRT-LLM 目前属于可选部署方案，仓库未直接依赖这些 SDK；StepFun 可由网关选择或在面板中直连切换。
 
 ## 优化方案
 

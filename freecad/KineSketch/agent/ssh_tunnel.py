@@ -10,6 +10,7 @@ import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Callable
 from .cancellation import RequestCancellation
 
 
@@ -31,13 +32,16 @@ class SSHTunnel:
     """Forward a random local TCP port through the system OpenSSH client."""
 
     def __init__(self, config: SSHConfig, remote_host: str, remote_port: int,
-                 cancellation: RequestCancellation | None = None) -> None:
+                 cancellation: RequestCancellation | None = None,
+                 on_status: Callable[[str], None] | None = None) -> None:
         self.config = config
         self.remote_host = remote_host
         self.remote_port = remote_port
         self.local_port: int | None = None
         self._process: subprocess.Popen[str] | None = None
         self._cancellation = cancellation
+        self._on_status = on_status
+        self.attempts = 0
 
     def __enter__(self) -> SSHTunnel:
         self.open()
@@ -64,6 +68,9 @@ class SSHTunnel:
         for attempt in range(3):
             if self._cancellation is not None:
                 self._cancellation.check()
+            self.attempts = attempt + 1
+            if self._on_status is not None:
+                self._on_status(f"Connecting SSH ({self.attempts}/3)...")
             local_port = _reserve_local_port()
             command = [
                 executable,
@@ -108,7 +115,9 @@ class SSHTunnel:
                 _stop_process(process)
                 if self._cancellation is not None:
                     self._cancellation.check()
-                if attempt == 2 or "Connection closed" not in str(error):
+                transient = ("connection closed", "connection reset", "connection refused",
+                             "connection timed out", "did not become ready", "no route to host")
+                if attempt == 2 or not any(text in str(error).lower() for text in transient):
                     raise
                 self._wait_retry(0.5 * (attempt + 1))
                 continue

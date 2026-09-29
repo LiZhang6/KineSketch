@@ -22,8 +22,13 @@ from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
 
 
+REASONING_PREVIEW_LIMIT = 2000
+
+
 class _RequestWorker(QtCore.QObject):
     content_delta = QtCore.Signal(int, str)
+    reasoning_delta = QtCore.Signal(int, str)
+    status_changed = QtCore.Signal(int, str)
     completed = QtCore.Signal(int, object)
     failed = QtCore.Signal(int, str)
     finished = QtCore.Signal()
@@ -37,7 +42,22 @@ class _RequestWorker(QtCore.QObject):
         self.cancellation = RequestCancellation()
         self._stream_parts: list[str] = []
         self._stream_size = 0
-        self._last_stream_emit = time.monotonic()
+        self._last_stream_emit = 0.0
+        self._reasoning_parts: list[str] = []
+        self._reasoning_size = 0
+
+    def _emit_status(self, status: str) -> None:
+        self.cancellation.check()
+        self.status_changed.emit(self.request_id, status)
+
+    def _emit_reasoning(self, content: str) -> None:
+        self.cancellation.check()
+        excerpt = content[:max(0, REASONING_PREVIEW_LIMIT - self._reasoning_size)]
+        if excerpt:
+            self._reasoning_parts.append(excerpt)
+            self._reasoning_size += len(excerpt)
+        if time.monotonic() - self._last_stream_emit >= 0.075:
+            self._flush_content()
 
     def _emit_content(self, content: str) -> None:
         self.cancellation.check()
@@ -47,11 +67,14 @@ class _RequestWorker(QtCore.QObject):
             self._flush_content()
 
     def _flush_content(self) -> None:
+        if self._reasoning_parts:
+            self.reasoning_delta.emit(self.request_id, "".join(self._reasoning_parts))
+            self._reasoning_parts.clear()
         if self._stream_parts:
             self.content_delta.emit(self.request_id, "".join(self._stream_parts))
             self._stream_parts.clear()
             self._stream_size = 0
-            self._last_stream_emit = time.monotonic()
+        self._last_stream_emit = time.monotonic()
 
     def cancel(self) -> None:
         self.cancellation.cancel()
@@ -64,6 +87,8 @@ class _RequestWorker(QtCore.QObject):
                 self._messages,
                 TOOL_DEFINITIONS,
                 on_content=self._emit_content,
+                on_reasoning=self._emit_reasoning,
+                on_status=self._emit_status,
                 cancellation=self.cancellation,
             )
             self.cancellation.check()
@@ -107,6 +132,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._tool_step_scheduled = False
         self._streaming_reply_started = False
         self._stream_parts: list[str] = []
+        self._reasoning_parts: list[str] = []
+        self._reasoning_size = 0
+        self._last_connection = None
+        self._profile_tokens: dict[str, str] = {}
+        self._provider = "compatible"
         self._status_signature = None
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
@@ -163,15 +193,23 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 ),
             )
         )
-        self.model_edit = QtWidgets.QLineEdit(
-            self._settings.value(
+        self.provider_combo = QtWidgets.QComboBox(connection)
+        self.provider_combo.addItem("OpenAI-compatible / Gateway", "compatible")
+        self.provider_combo.addItem("StepFun", "stepfun")
+        self.provider_combo.addItem("StepFun International", "stepfun-international")
+        self.model_combo = QtWidgets.QComboBox(connection)
+        self.model_combo.setEditable(True)
+        self.model_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.model_combo.addItems(["openclaw/default", "step-3.5-flash", "step-3.5-flash-2603",
+                                  "step-3.7-flash", "step-5-preview"])
+        self.model_combo.setEditText(str(self._settings.value(
                 "model",
                 os.getenv(
                     "KINESKETCH_AGENT_ID",
                     os.getenv("KINESKETCH_MODEL", "openclaw/default"),
                 ),
-            )
-        )
+            )))
+        self.model_edit = self.model_combo.lineEdit()
         self.api_key_edit = QtWidgets.QLineEdit(
             os.getenv(
                 "KINESKETCH_AGENT_TOKEN", os.getenv("KINESKETCH_API_KEY", "")
@@ -182,15 +220,17 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             App.Qt.translate("KineSketch", "Optional; not saved")
         )
         self.api_key_edit.setToolTip(App.Qt.translate("KineSketch", "Access token (ASCII only); leave empty if not required"))
+        form.addRow(App.Qt.translate("KineSketch", "Provider"), self.provider_combo)
         form.addRow(App.Qt.translate("KineSketch", "Endpoint"), self.endpoint_edit)
-        form.addRow(App.Qt.translate("KineSketch", "Agent"), self.model_edit)
+        form.addRow(App.Qt.translate("KineSketch", "Model"), self.model_combo)
         form.addRow(App.Qt.translate("KineSketch", "Access token"), self.api_key_edit)
 
         ssh_connection = QtWidgets.QGroupBox(
             App.Qt.translate("KineSketch", "SSH key tunnel"), container
         )
         ssh_connection.setCheckable(True)
-        ssh_connection.setChecked(self._settings.value("ssh/enabled", True, type=bool))
+        ssh_connection.setChecked(self._settings.value(
+            "profiles/compatible/ssh", self._settings.value("ssh/enabled", True, type=bool), type=bool))
         ssh_form = QtWidgets.QFormLayout(ssh_connection)
         ssh_form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
         ssh_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
@@ -213,6 +253,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         ssh_form.addRow(App.Qt.translate("KineSketch", "Server"), self.ssh_host_edit)
         ssh_form.addRow(App.Qt.translate("KineSketch", "Port"), self.ssh_port_edit)
         ssh_form.addRow(App.Qt.translate("KineSketch", "Username"), self.ssh_user_edit)
+        self.endpoint_edit.setText(str(self._settings.value(
+            "profiles/compatible/endpoint", self.endpoint_edit.text())))
+        self.model_combo.setEditText(str(self._settings.value(
+            "profiles/compatible/model", self.model_edit.text())))
 
         self.transcript = QtWidgets.QTextBrowser(container)
         self.transcript.setMinimumHeight(140)
@@ -226,6 +270,22 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 "KineSketch", "KineSketch"
             )
         )
+        self.reasoning_group = QtWidgets.QGroupBox(App.Qt.translate("KineSketch", "Thinking excerpt"), container)
+        reasoning_layout = QtWidgets.QVBoxLayout(self.reasoning_group)
+        reasoning_layout.setContentsMargins(6, 4, 6, 4)
+        self.reasoning_view = QtWidgets.QPlainTextEdit(self.reasoning_group)
+        self.reasoning_view.setReadOnly(True)
+        self.reasoning_view.setMaximumHeight(100)
+        reasoning_layout.addWidget(self.reasoning_view)
+        self.reasoning_group.hide()
+        self.reply_group = QtWidgets.QGroupBox(App.Qt.translate("KineSketch", "Reply (streaming)"), container)
+        reply_layout = QtWidgets.QVBoxLayout(self.reply_group)
+        reply_layout.setContentsMargins(6, 4, 6, 4)
+        self.reply_view = QtWidgets.QPlainTextEdit(self.reply_group)
+        self.reply_view.setReadOnly(True)
+        self.reply_view.setMaximumHeight(160)
+        reply_layout.addWidget(self.reply_view)
+        self.reply_group.hide()
 
         self.prompt_edit = QtWidgets.QPlainTextEdit(container)
         self.prompt_edit.setPlaceholderText(
@@ -304,6 +364,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         layout.addLayout(header)
         layout.addWidget(self.settings_area)
         layout.addWidget(self.transcript, 1)
+        layout.addWidget(self.reasoning_group)
+        layout.addWidget(self.reply_group)
         layout.addLayout(status_layout)
         layout.addWidget(self.status_progress)
         layout.addWidget(self.prompt_edit)
@@ -320,9 +382,38 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.model_edit.textChanged.connect(self._update_connection_summary)
         self.endpoint_edit.textChanged.connect(self._update_connection_summary)
         self.ssh_connection.toggled.connect(self._update_connection_summary)
+        self.provider_combo.currentIndexChanged.connect(self._change_provider)
+        saved_provider = str(self._settings.value("provider", "compatible"))
+        index = self.provider_combo.findData(saved_provider)
+        if index > 0:
+            self.provider_combo.setCurrentIndex(index)
         self._toggle_settings(self._settings.value("ui/settings_expanded", False, type=bool))
         self._update_connection_summary()
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
+
+    def _save_profile(self) -> None:
+        prefix = f"profiles/{self._provider}/"
+        self._settings.setValue(prefix + "endpoint", self.endpoint_edit.text().strip())
+        self._settings.setValue(prefix + "model", self.model_edit.text().strip())
+        self._settings.setValue(prefix + "ssh", self.ssh_connection.isChecked())
+        self._profile_tokens[self._provider] = self.api_key_edit.text()
+
+    def _change_provider(self, _index: int) -> None:
+        if self._busy:
+            return
+        self._save_profile()
+        self._provider = str(self.provider_combo.currentData())
+        cloud = self._provider.startswith("stepfun")
+        default_endpoint = ("https://api.stepfun.ai/v1" if self._provider == "stepfun-international"
+                            else "https://api.stepfun.com/v1") if cloud else "http://127.0.0.1:18789/v1"
+        prefix = f"profiles/{self._provider}/"
+        self.endpoint_edit.setText(str(self._settings.value(prefix + "endpoint", default_endpoint)))
+        self.model_combo.setEditText(str(self._settings.value(prefix + "model", "step-3.5-flash" if cloud else "openclaw/default")))
+        self.ssh_connection.setChecked(self._settings.value(prefix + "ssh", not cloud, type=bool))
+        self.api_key_edit.setText(self._profile_tokens.get(self._provider, ""))
+        self.api_key_edit.setPlaceholderText(App.Qt.translate("KineSketch", "API key; not saved" if cloud else "Optional; not saved"))
+        self._settings.setValue("provider", self._provider)
+        self._update_connection_summary()
 
     def _toggle_settings(self, expanded: bool) -> None:
         self.settings_button.setChecked(expanded)
@@ -421,12 +512,41 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._set_status(App.Qt.translate("KineSketch", "Invalid access token"), "error")
             return
 
-        self._settings.setValue("endpoint", endpoint)
-        self._settings.setValue("model", model)
-        self._settings.setValue("ssh/enabled", self.ssh_connection.isChecked())
+        if self._provider.startswith("stepfun"):
+            if not self.api_key_edit.text().strip():
+                self._toggle_settings(True)
+                self.api_key_edit.setFocus()
+                self._append("System", "StepFun requires an API key.")
+                self._set_status("API key required", "error")
+                return
+            if self._image is not None and model in ("step-3.5-flash", "step-3.5-flash-2603"):
+                self._toggle_settings(True)
+                self._append("System", "This StepFun model is text-only. Select step-3.7-flash or step-5-preview for images.")
+                self._set_status("Vision model required", "warning")
+                return
+
+        self._save_profile()
+        if self._provider == "compatible":
+            self._settings.setValue("endpoint", endpoint)
+            self._settings.setValue("model", model)
+        if self._provider == "compatible":
+            self._settings.setValue("ssh/enabled", self.ssh_connection.isChecked())
         self._settings.setValue("ssh/host", self.ssh_host_edit.text().strip())
         self._settings.setValue("ssh/port", self.ssh_port_edit.value())
         self._settings.setValue("ssh/user", self.ssh_user_edit.text().strip())
+        connection = (self._provider, endpoint, model, self.ssh_connection.isChecked(),
+                      self.ssh_host_edit.text().strip(), self.ssh_port_edit.value(),
+                      self.ssh_user_edit.text().strip())
+        if self._last_connection is not None and connection != self._last_connection:
+            self._session.clear()
+            self._conversation_id = self._new_conversation_id()
+        self._last_connection = connection
+        self._reasoning_size = 0
+        self._reasoning_parts.clear()
+        self.reasoning_view.clear()
+        self.reasoning_group.hide()
+        self.reply_view.clear()
+        self.reply_group.hide()
         self._session.begin(prompt, document_summary(), self._image)
         self._append("You", prompt)
         if self._image is not None:
@@ -452,6 +572,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             api_key=self.api_key_edit.text(),
             conversation_id=self._conversation_id,
             ssh=ssh_config,
+            provider=self._provider,
         )
         self._set_busy(True)
         self._set_status(
@@ -460,6 +581,10 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             busy=True,
         )
         self._streaming_reply_started = False
+        self._stream_parts.clear()
+        self.reply_view.clear()
+        self.reply_group.hide()
+        self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (streaming)"))
         self._reply_handled = False
         self._request_id += 1
 
@@ -468,6 +593,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.content_delta.connect(self._receive_content_delta)
+        worker.reasoning_delta.connect(self._receive_reasoning_delta)
+        worker.status_changed.connect(self._receive_status)
         worker.completed.connect(self._receive_reply)
         worker.failed.connect(self._receive_error)
         worker.finished.connect(thread.quit)
@@ -483,6 +610,24 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _receive_content_delta(self, request_id: int, content: str) -> None:
         if request_id == self._request_id and not self._stopped:
             self._handle_content_delta(content)
+
+    @QtCore.Slot(int, str)
+    def _receive_reasoning_delta(self, request_id: int, content: str) -> None:
+        if request_id != self._request_id or self._stopped:
+            return
+        excerpt = content[:max(0, REASONING_PREVIEW_LIMIT - self._reasoning_size)]
+        if excerpt:
+            self._reasoning_size += len(excerpt)
+            self._reasoning_parts.append(excerpt)
+            if not self._stream_timer.isActive():
+                self._stream_timer.start()
+        if not self._streaming_reply_started and not self._stream_parts:
+            self._set_status("Thinking...", "busy", busy=True)
+
+    @QtCore.Slot(int, str)
+    def _receive_status(self, request_id: int, status: str) -> None:
+        if request_id == self._request_id and not self._stopped:
+            self._set_status(App.Qt.translate("KineSketch", status), "busy", busy=True)
 
     @QtCore.Slot(int, object)
     def _receive_reply(self, request_id: int, message: dict[str, Any]) -> None:
@@ -502,6 +647,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._reply_handled = True
         try:
             tool_calls = self._session.accept_assistant(message)
+            self.reply_group.hide()
             if tool_calls:
                 self._append_unstreamed_content(message)
                 self._set_status(
@@ -515,7 +661,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 return
             self._append_unstreamed_content(message)
             self._set_status(
-                App.Qt.translate("KineSketch", "Response received"), "ready"
+                App.Qt.translate("KineSketch", "Answer complete"), "ready"
             )
         except Exception as error:
             self._append("System", str(error))
@@ -567,6 +713,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._stopped = True
         self._stream_timer.stop()
         self._stream_parts.clear()
+        self._reasoning_parts.clear()
+        self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (stopped)"))
         self._request_id += 1
         self._pending_tools.clear()
         self._tools_running = False
@@ -597,20 +745,37 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     @QtCore.Slot()
     def _flush_stream(self) -> None:
         self._stream_timer.stop()
-        if self._stopped or not self._stream_parts:
+        if self._stopped:
+            return
+        if self._reasoning_parts:
+            self.reasoning_group.show()
+            self._append_preview(self.reasoning_view, "".join(self._reasoning_parts))
+            self._reasoning_parts.clear()
+        if not self._stream_parts:
             return
         content = "".join(self._stream_parts)
         self._stream_parts.clear()
         if not self._streaming_reply_started:
-            self._begin_stream("KineSketch")
+            self.reply_group.show()
             self._streaming_reply_started = True
-        self._append_stream_text(content)
+        self._append_preview(self.reply_view, content)
+
+    @staticmethod
+    def _append_preview(view, text: str) -> None:
+        scrollbar = view.verticalScrollBar()
+        previous = scrollbar.value()
+        follow = previous >= scrollbar.maximum() - 24
+        cursor = QtGui.QTextCursor(view.document())
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        scrollbar.setValue(scrollbar.maximum() if follow else previous)
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
         if self._stopped:
             return
         self._flush_stream()
+        self.reply_group.setTitle(App.Qt.translate("KineSketch", "Reply (incomplete)"))
         self._reply_handled = True
         self._append("System", message)
         self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
@@ -644,6 +809,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._session.clear()
         self._stream_timer.stop()
         self._stream_parts.clear()
+        self._reasoning_parts.clear()
+        self.reasoning_view.clear()
+        self.reasoning_group.hide()
+        self.reply_view.clear()
+        self.reply_group.hide()
         self._remove_image()
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
@@ -698,8 +868,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     def _append_unstreamed_content(self, message: dict[str, Any]) -> None:
         content = message.get("content") or ""
-        if content and not self._streaming_reply_started:
-            self._append("KineSketch", str(content))
+        if content:
+            self._append("Agent actions" if message.get("tool_calls") else "KineSketch", str(content))
 
     def _begin_stream(self, speaker: str) -> None:
         scrollbar = self.transcript.verticalScrollBar()

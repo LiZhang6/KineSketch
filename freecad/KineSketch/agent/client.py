@@ -8,6 +8,7 @@ import json
 import socket
 import io
 import time
+import ssl
 from contextlib import contextmanager
 from http.client import HTTPConnection, HTTPSConnection, HTTPException, HTTPResponse
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ class AgentClientError(RuntimeError):
 
 
 ContentCallback = Callable[[str], None]
+StatusCallback = Callable[[str], None]
 
 
 def validate_access_token(token: str) -> str:
@@ -51,6 +53,8 @@ class AgentConfig:
     max_tokens: int | None = None
     think: bool | None = None
     tool_choice: str | dict[str, Any] = "auto"
+    provider: str = "compatible"
+    connection_attempts: int = 3
 
     @property
     def chat_completions_url(self) -> str:
@@ -68,8 +72,10 @@ class AgentClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
-        tool_choice: str = "auto",
+        tool_choice: str | dict[str, Any] | None = None,
         cancellation: RequestCancellation | None = None,
+        on_reasoning: ContentCallback | None = None,
+        on_status: StatusCallback | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -89,8 +95,10 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
-        tool_choice: str = "auto",
+        tool_choice: str | dict[str, Any] | None = None,
         cancellation: RequestCancellation | None = None,
+        on_reasoning: ContentCallback | None = None,
+        on_status: StatusCallback | None = None,
     ) -> dict[str, Any]:
         if cancellation is not None:
             cancellation.check()
@@ -103,16 +111,19 @@ class OpenAICompatibleClient:
             payload["user"] = self.config.conversation_id
         if self.config.max_tokens is not None:
             payload["max_tokens"] = self.config.max_tokens
-        if self.config.think is not None:
+        if self.config.provider.startswith("stepfun"):
+            payload["reasoning_format"] = "deepseek-style"
+        elif self.config.think is not None:
             payload["think"] = self.config.think
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = tool_choice
-        if on_content is not None:
+            payload["tool_choice"] = self.config.tool_choice if tool_choice is None else tool_choice
+        streaming = on_content is not None or on_reasoning is not None
+        if streaming:
             payload["stream"] = True
 
         headers = {
-            "Accept": "text/event-stream" if on_content is not None else "application/json",
+            "Accept": "text/event-stream" if streaming else "application/json",
             "Content-Type": "application/json",
             "User-Agent": "KineSketch-FreeCAD-Agent/1.0",
         }
@@ -126,9 +137,12 @@ class OpenAICompatibleClient:
             method="POST",
         )
         try:
-            with _open_response(request, self.config.timeout, cancellation) as response:
-                if on_content is not None:
-                    return _read_streaming_message(response, on_content, cancellation)
+            with _open_response(request, self.config.timeout, cancellation, on_status,
+                                self.config.connection_attempts) as response:
+                content_type = getattr(response, "headers", {}).get("Content-Type", "")
+                if streaming and not (isinstance(content_type, str) and "application/json" in content_type):
+                    return _read_streaming_message(response, on_content or (lambda _: None),
+                                                   cancellation, on_reasoning)
                 result = json.loads(response.read().decode("utf-8"))
                 if cancellation is not None:
                     cancellation.check()
@@ -150,6 +164,9 @@ class OpenAICompatibleClient:
             raise AgentClientError("Model response contains no assistant message") from error
         if not isinstance(message, dict):
             raise AgentClientError("Model response contains an invalid assistant message")
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
+        if isinstance(reasoning, str) and on_reasoning is not None:
+            on_reasoning(reasoning)
         if not message.get("content") and not message.get("tool_calls"):
             raise AgentClientError(
                 "Model returned no text or tool calls; increase the endpoint's output token limit"
@@ -171,17 +188,24 @@ class SSHTunneledAgentClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_content: ContentCallback | None = None,
-        tool_choice: str = "auto",
+        tool_choice: str | dict[str, Any] | None = None,
         cancellation: RequestCancellation | None = None,
+        on_reasoning: ContentCallback | None = None,
+        on_status: StatusCallback | None = None,
     ) -> dict[str, Any]:
         parsed = _parse_tunnel_endpoint(self.config.endpoint)
         remote_port = parsed.port or 80
         options = {"cancellation": cancellation} if cancellation is not None else {}
+        if on_status is not None:
+            options["on_status"] = on_status
         with SSHTunnel(self.config.ssh, parsed.hostname or "", remote_port, **options) as tunnel:
             local_endpoint = urlunsplit(
                 parsed._replace(netloc=f"127.0.0.1:{tunnel.local_port}")
             )
-            direct_config = replace(self.config, endpoint=local_endpoint, ssh=None)
+            direct_config = replace(self.config, endpoint=local_endpoint, ssh=None,
+                                    connection_attempts=max(1, 4 - tunnel.attempts))
+            if on_reasoning is not None:
+                options["on_reasoning"] = on_reasoning
             return OpenAICompatibleClient(direct_config).complete(
                 messages,
                 tools,
@@ -192,22 +216,56 @@ class SSHTunneledAgentClient:
 
 
 @contextmanager
-def _open_response(request: Request, timeout: float, cancellation: RequestCancellation | None):
-    if cancellation is None:
-        with urlopen(request, timeout=timeout) as response:
-            yield response
+def _open_response(request: Request, timeout: float, cancellation: RequestCancellation | None,
+                   on_status: StatusCallback | None = None, attempts: int = 3):
+    attempts = max(1, min(3, attempts))
+    if cancellation is None and on_status is None:
+        for attempt in range(attempts):
+            try:
+                response = urlopen(request, timeout=timeout)
+                break
+            except URLError as error:
+                if (not isinstance(error.reason, (ConnectionRefusedError, socket.gaierror))
+                        or attempt + 1 >= attempts):
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        with response as opened:
+            yield opened
         return
+    cancellation = cancellation or RequestCancellation()
     parsed = urlsplit(request.full_url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("Agent endpoint must be an absolute HTTP or HTTPS URL")
     connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
-    connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
-    connection.response_class = lambda sock, **kwargs: HTTPResponse(
-        _ResponseSocket(sock, cancellation, timeout), **kwargs)
+    connection = connection_type(parsed.hostname, parsed.port, timeout=min(10.0, timeout))
+    connection.response_class = lambda sock, **kwargs: _InterruptibleHTTPResponse(
+        sock, cancellation, timeout, **kwargs)
     try:
         cancellation.check()
-        connection.connect()
+        # Retry only TCP/TLS establishment, never a POST that might already be accepted.
+        for attempt in range(attempts):
+            cancellation.check()
+            if on_status is not None:
+                on_status(f"Connecting to model ({attempt + 1}/{attempts})...")
+            try:
+                connection.connect()
+                break
+            except ssl.SSLError:
+                raise
+            except OSError:
+                connection.close()
+                cancellation.check()
+                if attempt + 1 >= attempts:
+                    raise
+                deadline = time.monotonic() + 0.5 * (attempt + 1)
+                while time.monotonic() < deadline:
+                    cancellation.check()
+                    time.sleep(0.05)
+        cancellation.check()
+        if on_status is not None:
+            on_status("Thinking...")
         transport = connection.sock
+        transport.settimeout(timeout)
         # Interrupt the socket immediately; response cleanup stays on the worker.
         def interrupt():
             try:
@@ -228,6 +286,13 @@ def _open_response(request: Request, timeout: float, cancellation: RequestCancel
                 yield response
     finally:
         connection.close()
+
+
+class _InterruptibleHTTPResponse(HTTPResponse):
+    def __init__(self, transport, cancellation, timeout, **kwargs):
+        # HTTPResponse.close can run even if cancellation interrupts construction.
+        self.fp = None
+        super().__init__(_ResponseSocket(transport, cancellation, timeout), **kwargs)
 
 
 class _ResponseSocket:
@@ -279,7 +344,8 @@ class _ResponseReader(io.RawIOBase):
 
 
 def _read_streaming_message(response: Any, on_content: ContentCallback,
-                            cancellation: RequestCancellation | None = None) -> dict[str, Any]:
+                            cancellation: RequestCancellation | None = None,
+                            on_reasoning: ContentCallback | None = None) -> dict[str, Any]:
     content_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     received_done = False
@@ -311,6 +377,9 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
                 raise AgentClientError("Model endpoint returned an invalid stream delta")
 
             content = delta.get("content")
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning and on_reasoning is not None:
+                on_reasoning(reasoning)
             if isinstance(content, str) and content:
                 content_parts.append(content)
                 on_content(content)
@@ -319,6 +388,8 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
                 raise AgentClientError("Model endpoint returned invalid tool-call deltas")
             for call_delta in call_deltas:
                 _merge_tool_call_delta(tool_calls, call_delta)
+            if choices[0].get("finish_reason") == "length":
+                raise AgentClientError("Model reached its output token limit; the reply is incomplete")
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AgentClientError("Model endpoint returned an invalid SSE stream") from error
 
