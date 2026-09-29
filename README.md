@@ -120,6 +120,8 @@ The initial agent can:
 - create parametric boxes and cylinders;
 - change an object's position and rotation;
 - switch to axonometric view and fit all objects;
+- capture the current FreeCAD 3D viewport and send the screenshot as an image to
+  a vision-capable model;
 - turn a text description of the supported four-part, rail-guided slider-crank
   into a new box/cylinder feature plan and four separate FreeCAD solids, verify its
   native FreeCAD Assembly and motion, export a FreeCAD viewport MP4, and replay
@@ -131,6 +133,25 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
+
+### Experimental visual check
+
+Select **Visual check after actions (experimental)** in the Agent panel to send
+one viewport screenshot to the configured model after a successful action turn.
+The model receives a PNG as an OpenAI-compatible `image_url` data URI and returns
+a visual review without access to CAD tools in that review request. The checkbox
+is off by default and its state is saved in local Qt settings. You can also ask
+the agent to call `capture_viewport` when you want a screenshot inspected during
+a conversation. The screenshot is captured from the currently active 3D view at
+1024 × 768 pixels. The tool result and panel transcript show only image metadata;
+the temporary PNG is removed after encoding.
+
+Use a model and endpoint that accept image input. Qwen3.6 supports Base64 image
+input through the OpenAI-compatible chat API, but a particular local model build
+or inference server still needs to expose its vision capability. If image input
+is rejected, the panel reports the endpoint error. The check is visual evidence
+only: hidden geometry, exact measurements, and solver state still require the
+structured FreeCAD and Assembly results.
 
 `build_slider_crank_from_plan` and `replay_slider_crank` are the chat tools for
 the documented slider-crank example. The model supplies explicit dimensions

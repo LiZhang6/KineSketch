@@ -126,6 +126,20 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "capture_viewport",
+            "description": (
+                "Capture the current FreeCAD 3D viewport. The PNG will be sent as "
+                "a real image in the next model request, so call this when you "
+                "need to visually inspect the result. The tool result itself "
+                "contains only image metadata. A screenshot cannot prove hidden "
+                "geometry, exact dimensions, or solver correctness."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "build_slider_crank_from_plan",
             "description": (
                 "Build a zero-offset, rail-guided slider-crank from YOUR explicit "
@@ -221,6 +235,7 @@ def execute_tool_call(tool_call: dict[str, Any]) -> str:
         "create_cylinder": _create_cylinder,
         "set_placement": _set_placement,
         "fit_view": _fit_view,
+        "capture_viewport": _capture_viewport,
         "build_slider_crank_from_plan": _build_slider_crank_from_plan,
         "create_slider_crank_demo": _create_slider_crank_demo,
         "replay_slider_crank": _replay_slider_crank,
@@ -388,6 +403,12 @@ def _fit_view(arguments: dict[str, Any]) -> dict[str, Any]:
     App.Gui.activeDocument().activeView().viewAxonometric()
     App.Gui.activeDocument().activeView().fitAll()
     return {"ok": True}
+
+
+def _capture_viewport(arguments: dict[str, Any]) -> dict[str, Any]:
+    from .vision import capture_viewport
+
+    return capture_viewport(arguments)
 
 
 def _create_slider_crank_demo(arguments: dict[str, Any]) -> dict[str, Any]:

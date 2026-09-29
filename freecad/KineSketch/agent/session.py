@@ -41,7 +41,23 @@ This geometry skill and the Assembly/Kinematic skills support this topology only
 If the tool rejects a feature plan, correct its reported issue and retry within
 the tool-round limit. Use replay_slider_crank for a later replay request. Do not
 approximate this mechanism with unrelated standalone primitive tool calls and
-do not emit Python code for execution."""
+do not emit Python code for execution. When visual inspection is useful, call
+capture_viewport. Its image arrives in the next user message. Describe only
+what is visible and distinguish visual observations from CAD/solver tool results."""
+
+
+VIEWPORT_TOOL_PROMPT = (
+    "FreeCAD viewport screenshot requested by capture_viewport. Inspect this "
+    "image for the current task. Report visible evidence and uncertainty; use "
+    "tool results for dimensions, hidden geometry, and solver status."
+)
+
+POST_ACTION_REVIEW_PROMPT = (
+    "Experimental visual check of the FreeCAD viewport after the actions above. "
+    "Compare the visible result with the original user request and tool results. "
+    "State whether the visible result appears consistent, list concrete visible "
+    "problems, and say what the screenshot cannot verify. Do not call tools."
+)
 
 
 class AgentSession:
@@ -102,6 +118,19 @@ class AgentSession:
             {"role": "tool", "tool_call_id": call_id, "content": result}
         )
 
+    def add_viewport_images(self, data_urls: list[str], *, post_action: bool) -> None:
+        if not data_urls:
+            return
+        prompt = POST_ACTION_REVIEW_PROMPT if post_action else VIEWPORT_TOOL_PROMPT
+        self._messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                *({"type": "image_url", "image_url": {"url": url}}
+                  for url in data_urls),
+            ],
+        })
+
     def continue_after_tools(self) -> None:
         self._tool_rounds += 1
         if self._tool_rounds >= self.max_tool_rounds:
@@ -114,5 +143,9 @@ class AgentSession:
         self._turn_start = 1
 
     def _trim_history(self) -> None:
+        # Previous turns are not resent; discard their large inline screenshots.
+        for message in self._messages[1:]:
+            if isinstance(message.get("content"), list):
+                message["content"] = "[viewport image used in an earlier turn]"
         if len(self._messages) > 30:
             self._messages = [self._messages[0], *self._messages[-24:]]

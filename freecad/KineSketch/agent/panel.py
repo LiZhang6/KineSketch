@@ -20,19 +20,29 @@ from .client import AgentConfig, create_agent_client
 from .session import AgentSession
 from .ssh_tunnel import SSHConfig
 from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call, local_tool_summary
+from .vision import capture_viewport
+
+
+_VISUAL_CHANGE_TOOLS = frozenset({
+    "create_box", "create_cylinder", "set_placement", "fit_view",
+    "build_slider_crank_from_plan", "create_slider_crank_demo",
+    "replay_slider_crank",
+})
 
 
 class _RequestWorker:
-    def __init__(self, config: AgentConfig, messages: list[dict[str, Any]]) -> None:
+    def __init__(self, config: AgentConfig, messages: list[dict[str, Any]],
+                 tools: list[dict[str, Any]] | None) -> None:
         self._config = config
         self._messages = messages
+        self._tools = tools
         self.events: SimpleQueue[tuple[str, Any]] = SimpleQueue()
 
     def run(self) -> None:
         try:
             reply = create_agent_client(self._config).complete(
                 self._messages,
-                TOOL_DEFINITIONS,
+                self._tools,
                 on_content=lambda content: self.events.put(("content", content)),
             )
         except Exception as error:
@@ -61,6 +71,11 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._reply_pending = False
         self._continue_after_finish = False
         self._turn_tool_count = 0
+        self._visual_change_this_turn = False
+        self._viewport_sent_this_turn = False
+        self._visual_check_failed = False
+        self._next_request_review = False
+        self._review_request = False
         self._streaming_reply_started = False
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
@@ -132,6 +147,18 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         ssh_form.addRow(App.Qt.translate("KineSketch", "Port"), self.ssh_port_edit)
         ssh_form.addRow(App.Qt.translate("KineSketch", "Username"), self.ssh_user_edit)
 
+        self.visual_check = QtWidgets.QCheckBox(
+            App.Qt.translate("KineSketch", "Visual check after actions (experimental)"),
+            container,
+        )
+        self.visual_check.setChecked(
+            self._settings.value("vision/review_after_actions", False, type=bool)
+        )
+        self.visual_check.setToolTip(App.Qt.translate(
+            "KineSketch",
+            "Send a viewport screenshot to the configured vision model after CAD actions.",
+        ))
+
         self.transcript = QtWidgets.QTextBrowser(container)
         self.transcript.setOpenExternalLinks(True)
         self.transcript.setPlaceholderText(
@@ -175,6 +202,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
         layout.addWidget(connection)
         layout.addWidget(ssh_connection)
+        layout.addWidget(self.visual_check)
         layout.addWidget(self.transcript, 1)
         layout.addLayout(status_layout)
         layout.addWidget(self.status_progress)
@@ -221,13 +249,20 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._settings.setValue("ssh/host", self.ssh_host_edit.text().strip())
         self._settings.setValue("ssh/port", self.ssh_port_edit.value())
         self._settings.setValue("ssh/user", self.ssh_user_edit.text().strip())
+        self._settings.setValue(
+            "vision/review_after_actions", self.visual_check.isChecked()
+        )
         self._session.begin(prompt, document_summary())
         self._turn_tool_count = 0
+        self._visual_change_this_turn = False
+        self._viewport_sent_this_turn = False
+        self._visual_check_failed = False
         self._append("You", prompt)
         self.prompt_edit.clear()
         self._request_model()
 
-    def _request_model(self, status_message: str | None = None) -> None:
+    def _request_model(self, status_message: str | None = None,
+                       *, review_only: bool = False) -> None:
         ssh_config = None
         if self.ssh_connection.isChecked():
             ssh_config = SSHConfig(
@@ -244,7 +279,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             ssh=ssh_config,
             max_tokens=8192 if is_ollama else None,
             think=False if is_ollama else None,
-            tool_choice=self._session.tool_choice,
+            tool_choice="none" if review_only else self._session.tool_choice,
         )
         self._set_busy(True)
         self._set_status(
@@ -253,10 +288,14 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             busy=True,
         )
         self._streaming_reply_started = False
+        self._review_request = review_only
         self._reply_pending = True
         self._continue_after_finish = False
 
-        worker = _RequestWorker(config, self._session.request_messages)
+        worker = _RequestWorker(
+            config, self._session.request_messages,
+            None if review_only else TOOL_DEFINITIONS,
+        )
         thread = Thread(target=worker.run, name="KineSketchAgentRequest", daemon=True)
         self._thread = thread
         self._worker = worker
@@ -294,6 +333,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         try:
             tool_calls = self._session.accept_assistant(message)
             if tool_calls:
+                if self._review_request:
+                    raise ValueError("Visual check returned unexpected tool calls")
                 self._append_unstreamed_content(message)
                 self._set_status(
                     App.Qt.translate("KineSketch", "Applying agent actions..."),
@@ -301,6 +342,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                     busy=True,
                 )
                 local_summaries: list[str | None] = []
+                viewport_images: list[str] = []
                 for tool_call in tool_calls:
                     result = execute_tool_call(tool_call)
                     self._turn_tool_count += 1
@@ -310,9 +352,28 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                         if isinstance(function, dict)
                         else "Invalid tool"
                     )
-                    self._append("FreeCAD", f"{name}: {result}")
-                    self._session.add_tool_result(str(tool_call.get("id", "")), result)
-                    local_summaries.append(local_tool_summary(name, result))
+                    result_data = json.loads(result)
+                    if not isinstance(result_data, dict):
+                        raise ValueError(f"Invalid result from {name}")
+                    image_url = result_data.pop("_image_data_url", None)
+                    if image_url is not None:
+                        if name != "capture_viewport" or not isinstance(image_url, str):
+                            raise ValueError(f"Invalid image from {name}")
+                        viewport_images.append(image_url)
+                        self._viewport_sent_this_turn = True
+                    visible_result = json.dumps(result_data, ensure_ascii=False)
+                    self._append("FreeCAD", f"{name}: {visible_result}")
+                    self._session.add_tool_result(
+                        str(tool_call.get("id", "")), visible_result
+                    )
+                    if result_data.get("ok") and name in _VISUAL_CHANGE_TOOLS:
+                        self._visual_change_this_turn = True
+                        self._viewport_sent_this_turn = False
+                    local_summaries.append(local_tool_summary(name, visible_result))
+                if viewport_images:
+                    self._session.add_viewport_images(
+                        viewport_images, post_action=False
+                    )
                 if len(local_summaries) == 1 and local_summaries[0] is not None:
                     self._append("KineSketch", local_summaries[0])
                     result_data = json.loads(result)
@@ -321,6 +382,14 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                             and result_data.get("stage") in ("plan", "geometry")):
                         self._session.continue_after_tools()
                         self._continue_after_finish = True
+                        return
+                    if succeeded and self._schedule_visual_check():
+                        return
+                    if succeeded and self._visual_check_failed:
+                        self._set_status(
+                            App.Qt.translate("KineSketch", "Visual check unavailable"),
+                            "warning",
+                        )
                         return
                     self._set_status(
                         App.Qt.translate(
@@ -333,12 +402,19 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 self._continue_after_finish = True
                 return
             self._append_unstreamed_content(message)
-            status = (
-                App.Qt.translate("KineSketch", "Response received")
-                if self._turn_tool_count
-                else App.Qt.translate("KineSketch", "Text response received; no FreeCAD actions")
-            )
-            self._set_status(status, "ready")
+            if self._schedule_visual_check():
+                return
+            if self._review_request:
+                status = App.Qt.translate("KineSketch", "Visual check completed")
+            elif self._turn_tool_count:
+                status = App.Qt.translate("KineSketch", "Response received")
+            else:
+                status = App.Qt.translate(
+                    "KineSketch", "Text response received; no FreeCAD actions"
+                )
+            if self._visual_check_failed:
+                status = App.Qt.translate("KineSketch", "Visual check unavailable")
+            self._set_status(status, "warning" if self._visual_check_failed else "ready")
         except Exception as error:
             self._append("System", str(error))
             self._set_status(
@@ -347,6 +423,28 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         finally:
             self._reply_pending = False
             self._advance_request()
+
+    def _schedule_visual_check(self) -> bool:
+        if (self._review_request or not self.visual_check.isChecked()
+                or not self._visual_change_this_turn
+                or self._viewport_sent_this_turn or self._visual_check_failed):
+            return False
+        try:
+            screenshot = capture_viewport({})
+            image_url = screenshot.pop("_image_data_url")
+            self._session.add_viewport_images([image_url], post_action=True)
+        except Exception as error:
+            self._visual_check_failed = True
+            self._append("System", f"Visual check could not capture the viewport: {error}")
+            return False
+        self._append(
+            "FreeCAD",
+            f"Visual check: captured {screenshot['width']}×{screenshot['height']} PNG",
+        )
+        self._viewport_sent_this_turn = True
+        self._next_request_review = True
+        self._continue_after_finish = True
+        return True
 
     @QtCore.Slot(str)
     def _handle_content_delta(self, content: str) -> None:
@@ -365,7 +463,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
         self._append("System", message)
-        self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
+        status = "Visual check failed" if self._review_request else "Request failed"
+        self._set_status(App.Qt.translate("KineSketch", status), "error")
         self._reply_pending = False
         self._advance_request()
 
@@ -376,9 +475,16 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         if self._continue_after_finish:
             self._continue_after_finish = False
-            self._request_model(
-                App.Qt.translate("KineSketch", "Sending action results...")
+            review_only = self._next_request_review
+            self._next_request_review = False
+            status = App.Qt.translate(
+                "KineSketch",
+                "Checking viewport..." if review_only else "Sending action results...",
             )
+            if review_only:
+                self._request_model(status, review_only=True)
+            else:
+                self._request_model(status)
             return
         self._set_busy(False)
 
@@ -387,6 +493,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._thread is not None or self._reply_pending:
             return
         self._session.clear()
+        self._visual_change_this_turn = False
+        self._viewport_sent_this_turn = False
+        self._visual_check_failed = False
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
@@ -398,6 +507,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _set_busy(self, busy: bool) -> None:
         self.model_connection.setEnabled(not busy)
         self.ssh_connection.setEnabled(not busy)
+        self.visual_check.setEnabled(not busy)
         self.prompt_edit.setEnabled(not busy)
         self.clear_button.setEnabled(not busy)
         self.send_button.setEnabled(not busy)

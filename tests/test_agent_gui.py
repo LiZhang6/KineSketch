@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -57,6 +58,33 @@ def authored_parts_plan():
 
 
 class StreamingParserTests(unittest.TestCase):
+    def test_vision_message_is_sent_as_image_url_without_tools(self):
+        from freecad.KineSketch.agent import client as client_module
+        from freecad.KineSketch.agent.session import AgentSession
+
+        session = AgentSession()
+        session.begin("Check the CAD view", "One box")
+        session.add_viewport_images(["data:image/png;base64,AAAA"], post_action=True)
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((json.loads(request.data), timeout))
+            return BytesIO(json.dumps({"choices": [{"message": {
+                "role": "assistant", "content": "The box is visible."
+            }}]}).encode("utf-8"))
+
+        config = client_module.AgentConfig(endpoint="http://localhost/v1", model="qwen")
+        with patch.object(client_module, "urlopen", side_effect=fake_urlopen):
+            reply = client_module.OpenAICompatibleClient(config).complete(
+                session.request_messages, tools=None
+            )
+        self.assertEqual(reply["content"], "The box is visible.")
+        payload, _timeout = requests[0]
+        self.assertNotIn("tools", payload)
+        self.assertEqual(payload["messages"][-1]["content"][1], {
+            "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}
+        })
+
     def test_reasoning_only_response_is_an_error(self):
         from freecad.KineSketch.agent.client import AgentClientError, _read_streaming_message
 
@@ -252,6 +280,47 @@ class AgentGuiTests(unittest.TestCase):
         self.assertEqual(len(self.document.Objects), 0)
         self.assertIn("Text-only response.", self.panel.transcript.toPlainText())
         self.assertIn("no FreeCAD actions", self.panel.status_label.text())
+
+    def test_capture_tool_sends_real_png_without_base64_in_tool_result(self):
+        self.begin_turn("Create a box and inspect the viewport.")
+        with patch.object(self.panel, "_request_model") as request_model:
+            self.panel._handle_reply({"role": "assistant", "tool_calls": [
+                tool_call("create_box", {"length": 20, "width": 10, "height": 5}, "box"),
+                tool_call("fit_view", {}, "fit"),
+                tool_call("capture_viewport", {}, "capture"),
+            ]})
+        request_model.assert_called_once()
+        tool_result = next(m for m in self.panel._session.messages
+                           if m.get("tool_call_id") == "capture")
+        self.assertNotIn("base64", tool_result["content"])
+        self.assertNotIn("base64", self.panel.transcript.toPlainText())
+        image_message = self.panel._session.request_messages[-1]
+        image_url = image_message["content"][1]["image_url"]["url"]
+        self.assertTrue(image_url.startswith("data:image/png;base64,"))
+        image_bytes = base64.b64decode(image_url.split(",", 1)[1])
+        self.assertTrue(image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertLessEqual(len(image_bytes), 8 * 1024 * 1024)
+
+    def test_experimental_post_action_check_uses_one_image_only_round(self):
+        self.panel.visual_check.setChecked(True)
+        self.begin_turn("Create a box and visually check it.")
+        with patch.object(self.panel, "_request_model") as request_model:
+            self.panel._handle_reply({"role": "assistant", "tool_calls": [
+                tool_call("create_box", {"length": 20, "width": 10, "height": 5}, "box")
+            ]})
+            self.panel._reply_pending = True
+            self.panel._handle_reply({"role": "assistant", "content": "Box created."})
+            self.panel._review_request = True
+            self.panel._reply_pending = True
+            self.panel._handle_reply({"role": "assistant", "content": "Box appears visible."})
+        self.assertEqual(request_model.call_count, 2)
+        self.assertEqual(request_model.call_args_list[1].kwargs, {"review_only": True})
+        image_message = next(m for m in self.panel._session.request_messages
+                             if isinstance(m.get("content"), list))
+        self.assertIn("Experimental visual check", image_message["content"][0]["text"])
+        self.assertEqual(image_message["content"][1]["type"], "image_url")
+        self.assertNotIn("base64", self.panel.transcript.toPlainText())
+        self.assertEqual(self.panel.status_label.text(), "Visual check completed")
 
     def test_streaming_error_restores_controls_without_pending_continuation(self):
         self.begin_turn("Create a box.")
