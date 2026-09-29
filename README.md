@@ -139,6 +139,13 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
 
+Connection settings are collapsed behind the settings button and remember their
+expanded state. The chat panel wraps long messages and attachment filenames;
+streamed output refreshes in batches without pulling you away from older messages.
+Use Ctrl+Enter to send a message; Enter inserts a new line. The progress indicator
+appears only while working. Stop and image attachment controls remain available
+in the compact bottom toolbar.
+
 Use **Stop** to end the current turn immediately, interrupt its HTTP connection,
 and discard queued tools and late responses. You can send a new message without
 waiting for background connection cleanup. Completed CAD changes are preserved;

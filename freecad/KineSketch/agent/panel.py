@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from typing import Any, ClassVar
 from uuid import uuid4
@@ -34,10 +35,23 @@ class _RequestWorker(QtCore.QObject):
         self._messages = messages
         self.request_id = request_id
         self.cancellation = RequestCancellation()
+        self._stream_parts: list[str] = []
+        self._stream_size = 0
+        self._last_stream_emit = time.monotonic()
 
     def _emit_content(self, content: str) -> None:
         self.cancellation.check()
-        self.content_delta.emit(self.request_id, content)
+        self._stream_parts.append(content)
+        self._stream_size += len(content)
+        if self._stream_size >= 4096 or time.monotonic() - self._last_stream_emit >= 0.075:
+            self._flush_content()
+
+    def _flush_content(self) -> None:
+        if self._stream_parts:
+            self.content_delta.emit(self.request_id, "".join(self._stream_parts))
+            self._stream_parts.clear()
+            self._stream_size = 0
+            self._last_stream_emit = time.monotonic()
 
     def cancel(self) -> None:
         self.cancellation.cancel()
@@ -57,9 +71,11 @@ class _RequestWorker(QtCore.QObject):
             return
         except Exception as error:
             if not self.cancellation.cancelled:
+                self._flush_content()
                 self.failed.emit(self.request_id, str(error))
             return
         else:
+            self._flush_content()
             self.completed.emit(self.request_id, reply)
         finally:
             self.finished.emit()
@@ -90,19 +106,54 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._pending_tools: deque[dict[str, Any]] = deque()
         self._tool_step_scheduled = False
         self._streaming_reply_started = False
+        self._stream_parts: list[str] = []
+        self._status_signature = None
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
         self._build_ui()
+        self._stream_timer = QtCore.QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(75)
+        self._stream_timer.timeout.connect(self._flush_stream)
 
     def _build_ui(self) -> None:
         container = QtWidgets.QWidget(self)
         layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+        container.setMinimumWidth(280)
+
+        header = QtWidgets.QHBoxLayout()
+        self.connection_summary = QtWidgets.QLabel(container)
+        self.connection_summary.setTextFormat(QtCore.Qt.PlainText)
+        self.connection_summary.setWordWrap(True)
+        self.connection_summary.setMinimumWidth(0)
+        self.connection_summary.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.settings_button = QtWidgets.QToolButton(container)
+        self.settings_button.setCheckable(True)
+        self.settings_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView))
+        self.settings_button.setToolTip(App.Qt.translate("KineSketch", "Connection settings"))
+        self.settings_button.setAccessibleName(App.Qt.translate("KineSketch", "Connection settings"))
+        self.settings_button.setFixedSize(32, 32)
+        header.addWidget(self.connection_summary, 1)
+        header.addWidget(self.settings_button)
+
+        self.settings_area = QtWidgets.QScrollArea(container)
+        self.settings_area.setWidgetResizable(True)
+        self.settings_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.settings_area.setMaximumHeight(260)
+        settings = QtWidgets.QWidget(self.settings_area)
+        settings_layout = QtWidgets.QVBoxLayout(settings)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_area.setWidget(settings)
 
         connection = QtWidgets.QGroupBox(
             App.Qt.translate("KineSketch", "Model connection"), container
         )
         self.model_connection = connection
         form = QtWidgets.QFormLayout(connection)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         self.endpoint_edit = QtWidgets.QLineEdit(
             self._settings.value(
                 "endpoint",
@@ -140,6 +191,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         ssh_connection.setCheckable(True)
         ssh_connection.setChecked(self._settings.value("ssh/enabled", True, type=bool))
         ssh_form = QtWidgets.QFormLayout(ssh_connection)
+        ssh_form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        ssh_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         self.ssh_connection = ssh_connection
         self.ssh_host_edit = QtWidgets.QLineEdit(
             self._settings.value(
@@ -161,18 +214,25 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         ssh_form.addRow(App.Qt.translate("KineSketch", "Username"), self.ssh_user_edit)
 
         self.transcript = QtWidgets.QTextBrowser(container)
+        self.transcript.setMinimumHeight(140)
+        self.transcript.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.transcript.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        self.transcript.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.transcript.document().setDocumentMargin(8)
         self.transcript.setOpenExternalLinks(True)
         self.transcript.setPlaceholderText(
             App.Qt.translate(
-                "KineSketch", "Ask about the active document or request a CAD change."
+                "KineSketch", "KineSketch"
             )
         )
 
         self.prompt_edit = QtWidgets.QPlainTextEdit(container)
         self.prompt_edit.setPlaceholderText(
-            App.Qt.translate("KineSketch", "Describe what you want to create or change...")
+            App.Qt.translate("KineSketch", "Message...")
         )
+        self.prompt_edit.setMinimumHeight(70)
         self.prompt_edit.setMaximumHeight(110)
+        self.prompt_edit.installEventFilter(self)
 
         status_layout = QtWidgets.QHBoxLayout()
         status_layout.setContentsMargins(2, 0, 2, 0)
@@ -182,6 +242,9 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             App.Qt.translate("KineSketch", "Agent status")
         )
         self.status_label = QtWidgets.QLabel(container)
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(QtCore.Qt.PlainText)
+        self.status_label.setMinimumWidth(0)
         status_layout.addWidget(self.status_indicator)
         status_layout.addWidget(self.status_label, 1)
 
@@ -193,40 +256,57 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.image_button = QtWidgets.QToolButton(container)
         self.image_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
         self.image_button.setToolTip(App.Qt.translate("KineSketch", "Attach image"))
+        self.image_button.setAccessibleName(App.Qt.translate("KineSketch", "Attach image"))
+        self.image_button.setFixedSize(32, 32)
         self.image_label = QtWidgets.QLabel(container)
         self.image_label.setTextFormat(QtCore.Qt.PlainText)
         self.image_label.setWordWrap(True)
+        self.image_label.setMinimumWidth(0)
+        self.image_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         self.remove_image_button = QtWidgets.QToolButton(container)
         self.remove_image_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogCancelButton)
         )
         self.remove_image_button.setToolTip(App.Qt.translate("KineSketch", "Remove image"))
-        self.remove_image_button.setVisible(False)
-        attachments = QtWidgets.QHBoxLayout()
-        attachments.addWidget(self.image_button)
+        self.remove_image_button.setAccessibleName(App.Qt.translate("KineSketch", "Remove image"))
+        self.remove_image_button.setFixedSize(28, 28)
+        self.attachment_row = QtWidgets.QWidget(container)
+        attachments = QtWidgets.QHBoxLayout(self.attachment_row)
+        attachments.setContentsMargins(2, 0, 0, 0)
         attachments.addWidget(self.image_label, 1)
         attachments.addWidget(self.remove_image_button)
-        self.clear_button = QtWidgets.QPushButton(
-            App.Qt.translate("KineSketch", "Clear"), container
-        )
+        self.attachment_row.hide()
+        self.clear_button = QtWidgets.QToolButton(container)
+        self.clear_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogResetButton))
+        self.clear_button.setToolTip(App.Qt.translate("KineSketch", "Clear conversation"))
+        self.clear_button.setAccessibleName(App.Qt.translate("KineSketch", "Clear conversation"))
+        self.clear_button.setFixedSize(32, 32)
         self.send_button = QtWidgets.QPushButton(
             App.Qt.translate("KineSketch", "Send"), container
         )
         self.send_button.setDefault(True)
+        self.send_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowForward))
+        self.send_button.setToolTip(App.Qt.translate("KineSketch", "Send (Ctrl+Enter)"))
+        self.send_button.setMinimumWidth(84)
+        self.send_button.setFixedHeight(32)
         self.stop_button = QtWidgets.QPushButton(container)
+        self.stop_button.setFixedHeight(32)
         self._update_stop_button()
+        controls.addWidget(self.image_button)
         controls.addWidget(self.clear_button)
         controls.addStretch()
         controls.addWidget(self.stop_button)
         controls.addWidget(self.send_button)
 
-        layout.addWidget(connection)
-        layout.addWidget(ssh_connection)
+        settings_layout.addWidget(connection)
+        settings_layout.addWidget(ssh_connection)
+        layout.addLayout(header)
+        layout.addWidget(self.settings_area)
         layout.addWidget(self.transcript, 1)
         layout.addLayout(status_layout)
         layout.addWidget(self.status_progress)
         layout.addWidget(self.prompt_edit)
-        layout.addLayout(attachments)
+        layout.addWidget(self.attachment_row)
         layout.addLayout(controls)
         self.setWidget(container)
 
@@ -235,7 +315,33 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.stop_button.clicked.connect(self._stop_conversation)
         self.image_button.clicked.connect(self._attach_image)
         self.remove_image_button.clicked.connect(self._remove_image)
+        self.settings_button.toggled.connect(self._toggle_settings)
+        self.model_edit.textChanged.connect(self._update_connection_summary)
+        self.endpoint_edit.textChanged.connect(self._update_connection_summary)
+        self.ssh_connection.toggled.connect(self._update_connection_summary)
+        self._toggle_settings(self._settings.value("ui/settings_expanded", False, type=bool))
+        self._update_connection_summary()
         self._set_status(App.Qt.translate("KineSketch", "Ready"), "ready")
+
+    def _toggle_settings(self, expanded: bool) -> None:
+        self.settings_button.setChecked(expanded)
+        self.settings_area.setVisible(expanded)
+        self._settings.setValue("ui/settings_expanded", expanded)
+
+    def _update_connection_summary(self, *_args) -> None:
+        model = self.model_edit.text().strip()
+        self.connection_summary.setText(model.rsplit("/", 1)[-1] or App.Qt.translate("KineSketch", "Agent"))
+        transport = "SSH" if self.ssh_connection.isChecked() else "HTTP"
+        self.connection_summary.setToolTip(f"{model}\n{transport}: {self.endpoint_edit.text().strip()}")
+
+    def eventFilter(self, watched, event):
+        if (watched is self.prompt_edit and event.type() == QtCore.QEvent.KeyPress
+                and event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter)
+                and event.modifiers() & QtCore.Qt.ControlModifier):
+            if not event.isAutoRepeat():
+                self._send()
+            return True
+        return super().eventFilter(watched, event)
 
     @QtCore.Slot()
     def _attach_image(self) -> None:
@@ -254,6 +360,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         self._image = image
         self.image_label.setText(image.filename)
+        self.image_label.setToolTip(image.filename)
+        self.attachment_row.show()
         self.remove_image_button.setVisible(True)
 
     @QtCore.Slot()
@@ -262,6 +370,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             return
         self._image = None
         self.image_label.clear()
+        self.image_label.setToolTip("")
+        self.attachment_row.hide()
         self.remove_image_button.setVisible(False)
 
     @QtCore.Slot()
@@ -283,6 +393,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 "geometry; do not infer exact sizes from an unscaled photo."
             )
         if not endpoint or not model:
+            self._toggle_settings(True)
             self._append("System", "Endpoint and model are required.")
             self._set_status(
                 App.Qt.translate("KineSketch", "Configuration required"), "error"
@@ -292,6 +403,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             not self.ssh_host_edit.text().strip()
             or not self.ssh_user_edit.text().strip()
         ):
+            self._toggle_settings(True)
             self._append("System", "SSH server and username are required.")
             self._set_status(
                 App.Qt.translate("KineSketch", "SSH configuration required"),
@@ -376,6 +488,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _handle_reply(self, message: dict[str, Any]) -> None:
         if self._stopped:
             return
+        self._flush_stream()
         self._reply_handled = True
         try:
             tool_calls = self._session.accept_assistant(message)
@@ -442,6 +555,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if not self._busy:
             return
         self._stopped = True
+        self._stream_timer.stop()
+        self._stream_parts.clear()
         self._request_id += 1
         self._pending_tools.clear()
         self._tools_running = False
@@ -462,20 +577,30 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _handle_content_delta(self, content: str) -> None:
         if not content or self._stopped:
             return
+        self._stream_parts.append(content)
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+        self._set_status(
+            App.Qt.translate("KineSketch", "Receiving response..."), "busy", busy=True,
+        )
+
+    @QtCore.Slot()
+    def _flush_stream(self) -> None:
+        self._stream_timer.stop()
+        if self._stopped or not self._stream_parts:
+            return
+        content = "".join(self._stream_parts)
+        self._stream_parts.clear()
         if not self._streaming_reply_started:
             self._begin_stream("KineSketch")
             self._streaming_reply_started = True
         self._append_stream_text(content)
-        self._set_status(
-            App.Qt.translate("KineSketch", "Receiving response..."),
-            "busy",
-            busy=True,
-        )
 
     @QtCore.Slot(str)
     def _handle_error(self, message: str) -> None:
         if self._stopped:
             return
+        self._flush_stream()
         self._reply_handled = True
         self._append("System", message)
         self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
@@ -507,6 +632,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         if self._busy:
             return
         self._session.clear()
+        self._stream_timer.stop()
+        self._stream_parts.clear()
         self._remove_image()
         self._conversation_id = self._new_conversation_id()
         self.transcript.clear()
@@ -526,13 +653,13 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.remove_image_button.setEnabled(not busy)
         self.clear_button.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
-        self.send_button.setText(
-            App.Qt.translate("KineSketch", "Working...")
-            if busy
-            else App.Qt.translate("KineSketch", "Send")
-        )
 
     def _set_status(self, message: str, state: str, *, busy: bool = False) -> None:
+        signature = (message, state, busy)
+        if signature == self._status_signature:
+            return
+        self._status_signature = signature
+        self.status_progress.setVisible(busy)
         colors = {
             "ready": "#2e7d32",
             "busy": "#1976d2",
@@ -556,13 +683,8 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             )
 
     def _append(self, speaker: str, text: str) -> None:
-        cursor = self.transcript.textCursor()
-        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        if not self.transcript.document().isEmpty():
-            cursor.insertText("\n\n")
-        cursor.insertText(f"{speaker}\n{text}")
-        self.transcript.setTextCursor(cursor)
-        self.transcript.ensureCursorVisible()
+        self._begin_stream(speaker)
+        self._append_stream_text(text)
 
     def _append_unstreamed_content(self, message: dict[str, Any]) -> None:
         content = message.get("content") or ""
@@ -570,19 +692,36 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             self._append("KineSketch", str(content))
 
     def _begin_stream(self, speaker: str) -> None:
-        cursor = self.transcript.textCursor()
+        scrollbar = self.transcript.verticalScrollBar()
+        previous = scrollbar.value()
+        follow = previous >= scrollbar.maximum() - 24
+        cursor = QtGui.QTextCursor(self.transcript.document())
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        block = QtGui.QTextBlockFormat()
+        block.setTopMargin(12)
+        block.setBottomMargin(4)
+        heading = QtGui.QTextCharFormat()
+        heading.setFontWeight(QtGui.QFont.Bold)
+        heading.setForeground(self.palette().color(QtGui.QPalette.Highlight if speaker == "You" else QtGui.QPalette.Text))
         if not self.transcript.document().isEmpty():
-            cursor.insertText("\n\n")
-        cursor.insertText(f"{speaker}\n")
-        self.transcript.setTextCursor(cursor)
+            cursor.insertBlock(block, heading)
+        else:
+            cursor.setBlockFormat(block)
+        cursor.insertText(App.Qt.translate("KineSketch", speaker), heading)
+        body = QtGui.QTextCharFormat()
+        body.setFontWeight(QtGui.QFont.Normal)
+        body.setForeground(self.palette().color(QtGui.QPalette.Text))
+        cursor.insertBlock(QtGui.QTextBlockFormat(), body)
+        scrollbar.setValue(scrollbar.maximum() if follow else previous)
 
     def _append_stream_text(self, text: str) -> None:
-        cursor = self.transcript.textCursor()
+        scrollbar = self.transcript.verticalScrollBar()
+        previous = scrollbar.value()
+        follow = previous >= scrollbar.maximum() - 24
+        cursor = QtGui.QTextCursor(self.transcript.document())
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         cursor.insertText(text)
-        self.transcript.setTextCursor(cursor)
-        self.transcript.ensureCursorVisible()
+        scrollbar.setValue(scrollbar.maximum() if follow else previous)
 
 
 def show_agent_panel() -> AgentDockWidget:
