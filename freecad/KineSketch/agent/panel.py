@@ -14,7 +14,7 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
-from .client import AgentConfig, create_agent_client
+from .client import AgentClientError, AgentConfig, create_agent_client, validate_access_token
 from .cancellation import RequestCancellation, RequestCancelled
 from .images import ImageAttachment, load_image
 from .session import AgentSession
@@ -181,6 +181,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self.api_key_edit.setPlaceholderText(
             App.Qt.translate("KineSketch", "Optional; not saved")
         )
+        self.api_key_edit.setToolTip(App.Qt.translate("KineSketch", "Access token (ASCII only); leave empty if not required"))
         form.addRow(App.Qt.translate("KineSketch", "Endpoint"), self.endpoint_edit)
         form.addRow(App.Qt.translate("KineSketch", "Agent"), self.model_edit)
         form.addRow(App.Qt.translate("KineSketch", "Access token"), self.api_key_edit)
@@ -409,6 +410,15 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 App.Qt.translate("KineSketch", "SSH configuration required"),
                 "error",
             )
+            return
+
+        try:
+            validate_access_token(self.api_key_edit.text())
+        except AgentClientError as error:
+            self._toggle_settings(True)
+            self.api_key_edit.setFocus()
+            self._append("System", str(error))
+            self._set_status(App.Qt.translate("KineSketch", "Invalid access token"), "error")
             return
 
         self._settings.setValue("endpoint", endpoint)

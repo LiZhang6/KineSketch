@@ -27,6 +27,17 @@ class AgentClientError(RuntimeError):
 ContentCallback = Callable[[str], None]
 
 
+def validate_access_token(token: str) -> str:
+    """Normalize pasted tokens without exposing their contents in diagnostics."""
+    token = token.strip()
+    if not token.isascii() or any(ord(char) <= 32 or ord(char) == 127 for char in token):
+        raise AgentClientError(
+            "Access token must contain only printable ASCII characters without whitespace. "
+            "Remove pasted notes; leave this field empty if the service requires no token."
+        )
+    return token
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     """Connection settings for an OpenAI-compatible chat completion endpoint."""
@@ -67,6 +78,7 @@ class OpenAICompatibleClient:
             raise ValueError("Agent endpoint is required")
         if not config.model.strip():
             raise ValueError("Agent model is required")
+        self._api_key = validate_access_token(config.api_key)
         self.config = config
 
     def complete(
@@ -97,8 +109,8 @@ class OpenAICompatibleClient:
             "Content-Type": "application/json",
             "User-Agent": "KineSketch-FreeCAD-Agent/1.0",
         }
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
 
         request = Request(
             self.config.chat_completions_url,
@@ -140,6 +152,7 @@ class SSHTunneledAgentClient:
     def __init__(self, config: AgentConfig) -> None:
         if config.ssh is None:
             raise ValueError("SSH settings are required")
+        validate_access_token(config.api_key)
         self.config = config
 
     def complete(
