@@ -282,7 +282,8 @@ def _create_slider_crank(arguments: dict, parts_plan: dict | None) -> dict:
                 return response | {"error": video.get("error")}
             response["video"] = {"mp4": video["artifacts"]["video"],
                                  "report": video["artifacts"]["report"],
-                                 "verified_frames": video["checks"]["verified_frame_count"]}
+                                  "verified_frames": video["checks"]["verified_frame_count"],
+                                  "cycles": cycles}
         response["stage"] = "playback"
         checkpoint()
         simulation_doc = App.openDocument(motion["artifacts"]["simulation.FCStd"])

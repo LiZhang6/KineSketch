@@ -84,7 +84,13 @@ def video_review_frames(video: dict[str, Any]) -> list[Path]:
     count = video.get("verified_frames")
     if not isinstance(path, str) or not isinstance(count, int) or count < 2:
         return []
+    cycles = video.get("cycles")
+    if isinstance(cycles, (int, float)) and not isinstance(cycles, bool) and cycles > 0:
+        comparison_index = min(count - 1, max(1, round(count / (2 * cycles))))
+    else:
+        comparison_index = max(1, count // 4)
     video_path = Path(path)
     frames_dir = video_path.with_name(video_path.stem + "_frames")
-    frames = [frames_dir / f"frame_{index:04d}.png" for index in (0, count // 2)]
+    frames = [frames_dir / f"frame_{index:04d}.png"
+              for index in (0, comparison_index)]
     return frames if all(frame.is_file() for frame in frames) else []

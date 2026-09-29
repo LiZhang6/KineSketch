@@ -315,6 +315,7 @@ class AgentGuiTests(unittest.TestCase):
     def test_previous_slider_crank_prompt_reviews_exported_motion_frames(self):
         from PySide import QtGui
         from freecad.KineSketch.agent import panel as panel_module
+        from freecad.KineSketch.agent.vision import video_review_frames
 
         prompt_file = (Path(__file__).resolve().parents[1] / "docs"
                        / "slider_crank_gui_demo_prompt_zh.md")
@@ -323,7 +324,7 @@ class AgentGuiTests(unittest.TestCase):
         self.assertIn("126 mm", prompt)
         frames = self.scratch / "freecad_native_3d_frames"
         frames.mkdir()
-        for index, x in ((0, 250), (60, 550)):
+        for index, x in ((0, 250), (30, 550)):
             image = QtGui.QImage(1280, 720, QtGui.QImage.Format_RGB32)
             image.fill(QtGui.QColor("white"))
             painter = QtGui.QPainter(image)
@@ -338,9 +339,20 @@ class AgentGuiTests(unittest.TestCase):
             "simulation": {"sampled_frames": 401, "native_frames": 402,
                            "project": "simulation.FCStd", "csv": "motion.csv"},
             "video": {"verified_frames": 120,
-                      "mp4": str(self.scratch / "freecad_native_3d.mp4")},
+                      "mp4": str(self.scratch / "freecad_native_3d.mp4"),
+                      "cycles": 2},
             "playback_seconds": 120,
         }
+        self.assertEqual(
+            [path.name for path in video_review_frames(completed["video"])],
+            ["frame_0000.png", "frame_0030.png"],
+        )
+        self.assertEqual(
+            [path.name for path in video_review_frames(
+                completed["video"] | {"verified_frames": 240, "cycles": 4}
+            )],
+            ["frame_0000.png", "frame_0030.png"],
+        )
         self.panel.visual_check.setChecked(True)
         self.begin_turn(prompt)
         with patch.object(panel_module, "execute_tool_call", return_value=json.dumps(completed)):

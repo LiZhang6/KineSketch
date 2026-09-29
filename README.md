@@ -139,7 +139,7 @@ run on the GUI thread.
 Select **Visual check after actions (experimental)** in the Agent panel to send
 viewport images to the configured model after a successful action turn. For a
 slider-crank run with an exported MP4, it uses two already verified FreeCAD
-viewport frames from the start and middle of the video; other actions use the
+viewport frames separated by half a motion cycle when available; other actions use the
 current 3D view. Blank screenshots are rejected rather than sent to the model.
 The model receives PNGs as OpenAI-compatible `image_url` data URIs and returns
 a visual review without access to CAD tools in that review request. The checkbox
