@@ -24,7 +24,11 @@ For creation requests, call modeling tools instead of promising future work.
 For images, identify supported geometry first. Use readable dimensions; when
 dimensions are missing, choose feasible defaults in millimetres and report those
 assumptions. Do not claim exact reproduction of an unscaled image. Reasoning text
-and code blocks are never executed CAD operations."""
+and code blocks are never executed CAD operations. For follow-ups such as Continue,
+use the prior request and successful tool results to resume unfinished work.
+Do not recreate completed objects unless the user explicitly asks for duplicates.
+Use the current document's dimensions and placement rather than guessing them.
+A box's x/y/z is its minimum corner, not the centre of its bottom face."""
 
 SLIDER_CRANK_PROMPT = """For a rail-guided, zero-offset slider-crank with a base, crank, connecting rod
 and slider, translate the user's text into your own explicit additive feature
@@ -56,6 +60,8 @@ what is visible and distinguish visual observations from CAD/solver tool results
 
 
 CREATION_TOOLS = frozenset({"create_box", "create_cylinder", "build_slider_crank_from_plan"})
+HISTORY_TURNS = 8
+HISTORY_CHARACTERS = 60000
 
 
 def _requests_creation(text: str) -> bool:
@@ -92,6 +98,7 @@ class AgentSession:
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self._turn_start = 1
+        self._turn_starts: list[int] = []
         self._slider_crank_turn = False
         self._creation_requested = False
         self._creation_attempted = False
@@ -99,6 +106,8 @@ class AgentSession:
         self._missing_tool_retry = False
         self._has_image = False
         self.creation_error = ""
+        self._last_limited_content: str | None = None
+        self._empty_limit_retry = False
 
     @property
     def messages(self) -> list[dict[str, Any]]:
@@ -109,7 +118,7 @@ class AgentSession:
         prompt = SYSTEM_PROMPT
         if self._slider_crank_turn:
             prompt += "\n\n" + SLIDER_CRANK_PROMPT
-        return [{"role": "system", "content": prompt}, *self._messages[self._turn_start :]]
+        return [{"role": "system", "content": prompt}, *self._messages[1:]]
 
     @property
     def tool_choice(self) -> str | dict[str, Any]:
@@ -128,7 +137,10 @@ class AgentSession:
             if not matches:
                 raise ValueError(f"Required modeling tool is unavailable: {name}")
             return matches
-        if self._slider_crank_turn or (self._has_image and self._creation_requested):
+        mechanism_context = any(
+            call.get("function", {}).get("name") == "build_slider_crank_from_plan"
+            for message in self._messages[1:] for call in message.get("tool_calls", []))
+        if self._slider_crank_turn or mechanism_context or self._has_image:
             matches = list(tools)
         else:
             matches = [tool for tool in tools if tool.get("function", {}).get("name")
@@ -181,8 +193,28 @@ class AgentSession:
         )})
         return True
 
+    def continue_after_output_limit(self, content: str | None) -> bool:
+        progressed = bool(content and content != self._last_limited_content)
+        if not progressed:
+            if self._empty_limit_retry:
+                return False
+            self._empty_limit_retry = True
+        else:
+            self.accept_assistant({"content": content})
+            self._last_limited_content = content
+            self._empty_limit_retry = False
+        self._messages.append({"role": "user", "content": (
+            "The last response reached its output token limit, but this task is not finished. "
+            "Continue the original task from the successful tool results above. Do not "
+            "recreate objects or repeat completed actions. Keep reasoning and prose concise; "
+            "prioritize the remaining tool calls and a final answer. Any truncated tool "
+            "call was discarded and NOT executed: send a complete valid call if still needed."
+        )})
+        return True
+
     def begin(self, user_text: str, document_context: str,
               image: ImageAttachment | None = None) -> None:
+        self._close_pending_tool_calls("Previous request ended before this action was executed.")
         self._tool_rounds = 0
         lowered = user_text.lower()
         self._creation_requested = _requests_creation(user_text)
@@ -191,15 +223,22 @@ class AgentSession:
         self._missing_tool_retry = False
         self._has_image = image is not None
         self.creation_error = ""
+        self._last_limited_content = None
+        self._empty_limit_retry = False
         self._slider_crank_turn = (
             ("曲柄滑块" in user_text or "slider-crank" in lowered or "slider crank" in lowered)
             and self._creation_requested
             and not any(word in lowered for word in ("重播", "重新播放", "回放", "replay"))
         )
-        self._trim_history()
+        self._trim_history(keep_latest_image=image is None)
+        self._has_image = image is not None or any(
+            isinstance(message.get("content"), list) and
+            any(part.get("type") == "image_url" for part in message["content"])
+            for message in self._messages[1:])
         if any(word in lowered for word in ("重播", "重新播放", "回放", "replay")):
             self._creation_requested = False
         self._turn_start = len(self._messages)
+        self._turn_starts.append(self._turn_start)
         content = f"Current FreeCAD document:\n{document_context}\n\nUser request:\n{user_text}"
         if image is None:
             self._messages.append({"role": "user", "content": content})
@@ -266,27 +305,55 @@ class AgentSession:
         self._missing_tool_retry = False
         self._has_image = False
         self.creation_error = ""
+        self._last_limited_content = None
+        self._empty_limit_retry = False
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._turn_start = 1
+        self._turn_starts.clear()
 
-    def _trim_history(self) -> None:
-        # Previous turns are not resent; discard their large inline screenshots.
+    def _trim_history(self, *, keep_latest_image: bool) -> None:
+        latest_image = next((message for message in reversed(self._messages[1:])
+                             if isinstance(message.get("content"), list)
+                             and any(part.get("type") == "text" and
+                                     part.get("text", "").startswith("Current FreeCAD document:")
+                                     for part in message["content"])), None)
         for message in self._messages[1:]:
-            if isinstance(message.get("content"), list):
-                message["content"] = "[viewport image used in an earlier turn]"
-        if len(self._messages) > 30:
-            self._messages = [self._messages[0], *self._messages[-24:]]
+            content = message.get("content")
+            if isinstance(content, list) and not (keep_latest_image and message is latest_image):
+                text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
+                message["content"] = text + "\n[Earlier image omitted; request a new screenshot if needed.]"
 
-    def cancel_turn(self) -> None:
-        """Close unfinished tool calls without claiming they were executed."""
+        def history_size() -> int:
+            size = 0
+            for message in self._messages[1:]:
+                content = message.get("content")
+                if isinstance(content, list):
+                    size += sum(len(part.get("text", "")) for part in content if part.get("type") == "text")
+                elif isinstance(content, str):
+                    size += len(content)
+                size += len(json.dumps(message.get("tool_calls", [])))
+            return size
+
+        # Evict whole turns, never an assistant call without its tool results.
+        while len(self._turn_starts) > 1 and (
+                len(self._turn_starts) > HISTORY_TURNS or history_size() > HISTORY_CHARACTERS):
+            start = self._turn_starts[1]
+            self._messages = [self._messages[0], *self._messages[start:]]
+            self._turn_starts = [index - start + 1 for index in self._turn_starts[1:]]
+
+    def _close_pending_tool_calls(self, reason: str) -> None:
         turn = self._messages[self._turn_start:]
         completed = {item.get("tool_call_id") for item in turn if item["role"] == "tool"}
         for item in turn:
             for call in item.get("tool_calls", []):
                 if call["id"] not in completed:
                     self.add_tool_result(call["id"], json.dumps({
-                        "ok": False, "error": "Cancelled by user; action not executed.",
+                        "ok": False, "error": reason,
                     }))
+
+    def cancel_turn(self) -> None:
+        """Close unfinished tool calls without claiming they were executed."""
+        self._close_pending_tool_calls("Cancelled by user; action not executed.")
         self._messages.append({"role": "assistant", "content": "Conversation stopped by user."})
         self._slider_crank_turn = False
         self._creation_requested = False

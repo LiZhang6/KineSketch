@@ -48,7 +48,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_box",
-            "description": "Create a parametric Part Box in the active document.",
+            "description": (
+                "Create a parametric Part Box in the active document. "
+                "x/y/z specify its minimum XYZ corner, NOT the centre of its bottom face. "
+                "Length, width and height extend along +X, +Y and +Z in millimetres."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -209,10 +213,22 @@ def document_summary() -> str:
     selected_names: list[str] = []
     if App.GuiUp:
         selected_names = [obj.Name for obj in App.Gui.Selection.getSelection()]
-    objects = [
-        {"name": obj.Name, "label": obj.Label, "type": obj.TypeId}
-        for obj in document.Objects
-    ]
+    objects = []
+    for obj in document.Objects:
+        item = {"name": obj.Name, "label": obj.Label, "type": obj.TypeId}
+        properties = getattr(obj, "PropertiesList", ())
+        dimensions = {}
+        for name in ("Length", "Width", "Height", "Radius"):
+            if name in properties:
+                value = getattr(obj, name)
+                dimensions[name.lower()] = float(getattr(value, "Value", value))
+        if dimensions:
+            item["dimensions_mm"] = dimensions
+        if "Placement" in properties:
+            placement = obj.Placement
+            item["position_mm"] = [placement.Base.x, placement.Base.y, placement.Base.z]
+            item["rotation_quaternion_xyzw"] = list(placement.Rotation.Q)
+        objects.append(item)
     return json.dumps(
         {"name": document.Name, "objects": objects, "selected": selected_names},
         ensure_ascii=False,

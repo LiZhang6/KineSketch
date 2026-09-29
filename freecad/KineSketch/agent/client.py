@@ -36,6 +36,18 @@ class AgentEmptyResponseError(AgentClientError):
         )
 
 
+class AgentOutputLimitError(AgentClientError):
+    """Keep partial text for a follow-up, but never execute truncated tool calls."""
+
+    def __init__(self, content: str | None = None):
+        self.content = content
+        super().__init__(
+            "Model reached its output token limit; the reply is incomplete. "
+            "Send a follow-up to continue in this conversation, or increase Output tokens. "
+            "Incomplete tool calls were not executed."
+        )
+
+
 ContentCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 
@@ -185,6 +197,9 @@ class OpenAICompatibleClient:
             raise AgentClientError("Model response contains no assistant message") from error
         if not isinstance(message, dict):
             raise AgentClientError("Model response contains an invalid assistant message")
+        if result["choices"][0].get("finish_reason") == "length":
+            content = message.get("content")
+            raise AgentOutputLimitError(content if isinstance(content, str) else None)
         reasoning = message.get("reasoning_content") or message.get("reasoning")
         if isinstance(reasoning, str) and on_reasoning is not None:
             on_reasoning(reasoning)
@@ -414,7 +429,7 @@ def _read_streaming_message(response: Any, on_content: ContentCallback,
                 _merge_tool_call_delta(tool_calls, call_delta)
             finish_reason = choices[0].get("finish_reason") or finish_reason
             if finish_reason == "length":
-                raise AgentClientError("Model reached its output token limit; the reply is incomplete")
+                raise AgentOutputLimitError("".join(content_parts) or None)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AgentClientError("Model endpoint returned an invalid SSE stream") from error
 

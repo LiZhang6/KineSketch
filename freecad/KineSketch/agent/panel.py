@@ -15,7 +15,7 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from PySide import QtCore, QtGui, QtWidgets
 
-from .client import AgentClientError, AgentEmptyResponseError, AgentConfig, create_agent_client, validate_access_token
+from .client import AgentClientError, AgentEmptyResponseError, AgentOutputLimitError, AgentConfig, create_agent_client, validate_access_token
 from .cancellation import RequestCancellation, RequestCancelled
 from .images import ImageAttachment, load_image
 from .session import AgentSession, CREATION_TOOLS
@@ -95,6 +95,13 @@ class _RequestWorker(QtCore.QObject):
             )
             self.cancellation.check()
         except RequestCancelled:
+            return
+        except AgentOutputLimitError as error:
+            if not self.cancellation.cancelled:
+                self._flush_content()
+                self.completed.emit(self.request_id, {
+                    "content": error.content, "_output_limit_error": str(error),
+                })
             return
         except AgentEmptyResponseError as error:
             if not self.cancellation.cancelled:
@@ -686,6 +693,16 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._flush_stream()
         self._reply_handled = True
         try:
+            if message.get("_output_limit_error"):
+                content = message.get("content")
+                if self._session.continue_after_output_limit(content):
+                    if content:
+                        self._append("Agent response (continued)", content)
+                    self._continue_after_finish = True
+                    self._set_status("Continuing after output token limit...", "busy", busy=True)
+                    return
+                self._handle_error(str(message["_output_limit_error"]))
+                return
             empty_error = message.get("_empty_response_error")
             tool_calls = [] if empty_error else self._session.accept_assistant(message)
             self.reply_group.hide()
