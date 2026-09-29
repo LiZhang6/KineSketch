@@ -13,11 +13,16 @@ if ($manifest) {
 $freecad = Join-Path $prefix 'Library\bin\freecad.exe'
 $macro = Join-Path $PSScriptRoot 'run_freecad_gui.FCMacro'
 if (-not (Test-Path -LiteralPath $freecad -PathType Leaf)) { throw "Missing FreeCAD GUI: $freecad" }
+$env:PATH = $prefix + ';' + (Join-Path $prefix 'Library\bin') + ';' + (Join-Path $prefix 'Scripts') + ';' + $env:PATH
 
 $runId = [guid]::NewGuid().ToString('N')
 $runDirectory = Join-Path $root ('.pixi\native-test-runs\' + $runId)
 $demoDirectory = Join-Path $root ('outputs\demo_native_' + $runId)
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+$tempDirectory = Join-Path $runDirectory 'temp'
+New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
+$env:TEMP = $tempDirectory
+$env:TMP = $tempDirectory
 $report = Join-Path $runDirectory 'result.json'
 $requestPath = Join-Path $runDirectory 'demo_request.json'
 $request = @{ output_dir = $demoDirectory }

@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import json
 import os
+from queue import Empty, SimpleQueue
+from threading import Thread
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import FreeCAD as App
@@ -15,31 +19,26 @@ from PySide import QtCore, QtGui, QtWidgets
 from .client import AgentConfig, create_agent_client
 from .session import AgentSession
 from .ssh_tunnel import SSHConfig
-from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call
+from .tools import TOOL_DEFINITIONS, document_summary, execute_tool_call, local_tool_summary
 
 
-class _RequestWorker(QtCore.QObject):
-    content_delta = QtCore.Signal(str)
-    completed = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
-
+class _RequestWorker:
     def __init__(self, config: AgentConfig, messages: list[dict[str, Any]]) -> None:
-        super().__init__()
         self._config = config
         self._messages = messages
+        self.events: SimpleQueue[tuple[str, Any]] = SimpleQueue()
 
-    @QtCore.Slot()
     def run(self) -> None:
         try:
             reply = create_agent_client(self._config).complete(
                 self._messages,
                 TOOL_DEFINITIONS,
-                on_content=self.content_delta.emit,
+                on_content=lambda content: self.events.put(("content", content)),
             )
         except Exception as error:
-            self.failed.emit(str(error))
+            self.events.put(("failed", str(error)))
             return
-        self.completed.emit(reply)
+        self.events.put(("completed", reply))
 
 
 class AgentDockWidget(QtWidgets.QDockWidget):
@@ -54,9 +53,14 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
         )
         self._session = AgentSession()
-        self._thread: QtCore.QThread | None = None
+        self._thread: Thread | None = None
         self._worker: _RequestWorker | None = None
+        self._request_poll = QtCore.QTimer(self)
+        self._request_poll.setInterval(10)
+        self._request_poll.timeout.connect(self._poll_request)
+        self._reply_pending = False
         self._continue_after_finish = False
+        self._turn_tool_count = 0
         self._streaming_reply_started = False
         self._conversation_id = self._new_conversation_id()
         self._settings = QtCore.QSettings("KineSketch", "Agent")
@@ -184,7 +188,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _send(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None or self._reply_pending:
             return
         prompt = self.prompt_edit.toPlainText().strip()
         endpoint = self.endpoint_edit.text().strip()
@@ -218,6 +222,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
         self._settings.setValue("ssh/port", self.ssh_port_edit.value())
         self._settings.setValue("ssh/user", self.ssh_user_edit.text().strip())
         self._session.begin(prompt, document_summary())
+        self._turn_tool_count = 0
         self._append("You", prompt)
         self.prompt_edit.clear()
         self._request_model()
@@ -230,12 +235,16 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                 port=self.ssh_port_edit.value(),
                 username=self.ssh_user_edit.text().strip(),
             )
+        is_ollama = urlsplit(self.endpoint_edit.text().strip()).port == 11434
         config = AgentConfig(
             endpoint=self.endpoint_edit.text().strip(),
             model=self.model_edit.text().strip(),
             api_key=self.api_key_edit.text(),
             conversation_id=self._conversation_id,
             ssh=ssh_config,
+            max_tokens=8192 if is_ollama else None,
+            think=False if is_ollama else None,
+            tool_choice=self._session.tool_choice,
         )
         self._set_busy(True)
         self._set_status(
@@ -244,22 +253,41 @@ class AgentDockWidget(QtWidgets.QDockWidget):
             busy=True,
         )
         self._streaming_reply_started = False
+        self._reply_pending = True
+        self._continue_after_finish = False
 
-        thread = QtCore.QThread(self)
         worker = _RequestWorker(config, self._session.request_messages)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.content_delta.connect(self._handle_content_delta)
-        worker.completed.connect(self._handle_reply)
-        worker.failed.connect(self._handle_error)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._request_finished)
+        thread = Thread(target=worker.run, name="KineSketchAgentRequest", daemon=True)
         self._thread = thread
         self._worker = worker
+        self._request_poll.start()
         thread.start()
+
+    @QtCore.Slot()
+    def _poll_request(self) -> None:
+        worker = self._worker
+        if worker is None:
+            self._request_poll.stop()
+            return
+        while True:
+            try:
+                kind, value = worker.events.get_nowait()
+            except Empty:
+                return
+            if kind == "content":
+                self._handle_content_delta(value)
+                continue
+            self._request_poll.stop()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=2)
+            self._thread = None
+            self._worker = None
+            if kind == "completed":
+                self._handle_reply(value)
+            else:
+                self._handle_error(value)
+            return
 
     @QtCore.Slot(object)
     def _handle_reply(self, message: dict[str, Any]) -> None:
@@ -272,21 +300,53 @@ class AgentDockWidget(QtWidgets.QDockWidget):
                     "warning",
                     busy=True,
                 )
+                local_summaries: list[str | None] = []
                 for tool_call in tool_calls:
                     result = execute_tool_call(tool_call)
+                    self._turn_tool_count += 1
+                    function = tool_call.get("function")
+                    name = (
+                        function.get("name", "Invalid tool")
+                        if isinstance(function, dict)
+                        else "Invalid tool"
+                    )
+                    self._append("FreeCAD", f"{name}: {result}")
                     self._session.add_tool_result(str(tool_call.get("id", "")), result)
+                    local_summaries.append(local_tool_summary(name, result))
+                if len(local_summaries) == 1 and local_summaries[0] is not None:
+                    self._append("KineSketch", local_summaries[0])
+                    result_data = json.loads(result)
+                    succeeded = bool(result_data.get("ok"))
+                    if (not succeeded and name == "build_slider_crank_from_plan"
+                            and result_data.get("stage") in ("plan", "geometry")):
+                        self._session.continue_after_tools()
+                        self._continue_after_finish = True
+                        return
+                    self._set_status(
+                        App.Qt.translate(
+                            "KineSketch", "Actions completed" if succeeded else "Agent action failed"
+                        ),
+                        "ready" if succeeded else "error",
+                    )
+                    return
                 self._session.continue_after_tools()
                 self._continue_after_finish = True
                 return
             self._append_unstreamed_content(message)
-            self._set_status(
-                App.Qt.translate("KineSketch", "Response received"), "ready"
+            status = (
+                App.Qt.translate("KineSketch", "Response received")
+                if self._turn_tool_count
+                else App.Qt.translate("KineSketch", "Text response received; no FreeCAD actions")
             )
+            self._set_status(status, "ready")
         except Exception as error:
             self._append("System", str(error))
             self._set_status(
                 App.Qt.translate("KineSketch", "Agent action failed"), "error"
             )
+        finally:
+            self._reply_pending = False
+            self._advance_request()
 
     @QtCore.Slot(str)
     def _handle_content_delta(self, content: str) -> None:
@@ -306,11 +366,14 @@ class AgentDockWidget(QtWidgets.QDockWidget):
     def _handle_error(self, message: str) -> None:
         self._append("System", message)
         self._set_status(App.Qt.translate("KineSketch", "Request failed"), "error")
+        self._reply_pending = False
+        self._advance_request()
 
-    @QtCore.Slot()
-    def _request_finished(self) -> None:
-        self._thread = None
-        self._worker = None
+    def _advance_request(self) -> None:
+        # CAD operations can re-enter the Qt event loop. Wait for BOTH the reply
+        # handler and the worker thread before continuing or enabling Send/Clear.
+        if self._thread is not None or self._reply_pending:
+            return
         if self._continue_after_finish:
             self._continue_after_finish = False
             self._request_model(
@@ -321,7 +384,7 @@ class AgentDockWidget(QtWidgets.QDockWidget):
 
     @QtCore.Slot()
     def _clear(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None or self._reply_pending:
             return
         self._session.clear()
         self._conversation_id = self._new_conversation_id()

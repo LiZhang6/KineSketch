@@ -13,10 +13,15 @@ if ($manifest) {
 $freecadExe = Join-Path $prefix 'Library\bin\freecad.exe'
 $macro = Join-Path $PSScriptRoot 'run_freecad_gui.FCMacro'
 if (-not (Test-Path -LiteralPath $freecadExe -PathType Leaf)) { throw "Missing FreeCAD GUI: $freecadExe" }
+$env:PATH = $prefix + ';' + (Join-Path $prefix 'Library\bin') + ';' + (Join-Path $prefix 'Scripts') + ';' + $env:PATH
 
 $runId = [guid]::NewGuid().ToString('N')
 $runDirectory = Join-Path $workspaceRoot ('.pixi\native-test-runs\' + $runId)
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+$tempDirectory = Join-Path $runDirectory 'temp'
+New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
+$env:TEMP = $tempDirectory
+$env:TMP = $tempDirectory
 if ($manifest) {
     @{ manifest_path = $manifest } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDirectory 'parts_request.json') -Encoding UTF8
 }

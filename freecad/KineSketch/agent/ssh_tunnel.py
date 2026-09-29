@@ -53,58 +53,54 @@ class SSHTunnel:
                 "OpenSSH client was not found. Install or enable the system 'ssh' command."
             )
 
-        local_port = _reserve_local_port()
-        forward_target = _forward_target(local_port, self.remote_host, self.remote_port)
         timeout = max(1, int(self.config.timeout))
-        command = [
-            executable,
-            "-N",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "PasswordAuthentication=no",
-            "-o",
-            "KbdInteractiveAuthentication=no",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            f"ConnectTimeout={timeout}",
-            "-o",
-            "ServerAliveInterval=30",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-L",
-            forward_target,
-            "-p",
-            str(self.config.port),
-            f"{self.config.username}@{self.config.host}",
-        ]
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for attempt in range(3):
+            local_port = _reserve_local_port()
+            command = [
+                executable,
+                "-N",
+                "-o", "BatchMode=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "ExitOnForwardFailure=yes",
+                "-o", f"ConnectTimeout={timeout}",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-L", _forward_target(local_port, self.remote_host, self.remote_port),
+                "-p", str(self.config.port),
+                f"{self.config.username}@{self.config.host}",
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creation_flags,
+                )
+            except OSError as error:
+                raise SSHTunnelError(f"Cannot start OpenSSH: {error}") from error
 
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creation_flags,
-            )
-        except OSError as error:
-            raise SSHTunnelError(f"Cannot start OpenSSH: {error}") from error
+            try:
+                self._wait_until_ready(process, local_port)
+            except SSHTunnelError as error:
+                _stop_process(process)
+                if attempt == 2 or "Connection closed" not in str(error):
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            except Exception:
+                _stop_process(process)
+                raise
 
-        try:
-            self._wait_until_ready(process, local_port)
-        except Exception:
-            _stop_process(process)
-            raise
-
-        self._process = process
-        self.local_port = local_port
+            self._process = process
+            self.local_port = local_port
+            return
 
     def close(self) -> None:
         if self._process is not None:

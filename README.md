@@ -22,6 +22,10 @@ Python's standard library and the system OpenSSH client.
 4. Select **KineSketch > Open Agent** or use the KineSketch toolbar button.
 5. Ask the agent to create or modify geometry.
 
+On Windows with this repository's Pixi environment, start the GUI with
+`powershell -ExecutionPolicy Bypass -File .\start_freecad.ps1`. The launcher adds
+the environment root to `PATH` so FreeCAD can load `python314.dll`.
+
 For an OpenClaw Gateway running on the same machine:
 
 ```text
@@ -115,7 +119,11 @@ The initial agent can:
 - inspect active document objects and the current selection;
 - create parametric boxes and cylinders;
 - change an object's position and rotation;
-- switch to axonometric view and fit all objects.
+- switch to axonometric view and fit all objects;
+- turn a text description of the supported four-part, rail-guided slider-crank
+  into a new box/cylinder feature plan and four separate FreeCAD solids, verify its
+  native FreeCAD Assembly and motion, export a FreeCAD viewport MP4, and replay
+  its motion in the GUI.
 
 Geometry changes use FreeCAD transactions and can be reverted with Undo. The
 agent cannot execute arbitrary Python: model requests are limited to the
@@ -123,6 +131,46 @@ allowlisted tools in `freecad/KineSketch/agent/tools.py`.
 
 Network requests run outside the GUI thread, while all FreeCAD document changes
 run on the GUI thread.
+
+`build_slider_crank_from_plan` and `replay_slider_crank` are the chat tools for
+the documented slider-crank example. The model supplies explicit dimensions
+and local coordinates for additive features; the geometry skill builds fresh
+FCStd parts without loading the fixed demo fixture. The Assembly and Kinematic
+skills then build four native joints, verify solver motion, and can save an
+H.264 MP4 captured from the actual FreeCAD viewport. The supported topology is
+one zero-offset slider-crank, not arbitrary assemblies or simulation of
+unrelated primitives. The old `create_slider_crank_demo` handler remains for
+existing local callers but is not offered to the chat model.
+See [the repeatable Chinese GUI prompt](docs/slider_crank_gui_demo_prompt_zh.md)
+and [assembly and kinematic integration](docs/zhang_assembly_kinematic.md).
+
+## Diagnosing chat tool calls
+
+A text response verifies connectivity, not the ability to call FreeCAD tools.
+The server must return structured `tool_calls` for the functions supplied in the
+request. Replies such as "searching for FreeCAD tools" do not execute any CAD action.
+The panel displays each local tool result and labels text-only responses as having
+no FreeCAD actions.
+
+An SSH `Permission denied (publickey,password)` error occurs before contacting the
+model. Verify the passwordless login command above using the same Windows account
+and OpenSSH installation that launches FreeCAD.
+
+If the Gateway returns text but no client tools, test the underlying model's
+OpenAI-compatible endpoint directly through the same SSH tunnel. For a remote
+Ollama server, use `http://127.0.0.1:11434/v1` as Endpoint and the exact installed
+Ollama model name as Agent, with SSH still enabled. The address refers to the remote
+server. This mode talks directly to the model, so `openclaw/default` is not a model
+name for this endpoint. Configure the access token as required by that server.
+
+Run `pixi run test-native` to test the actual FreeCAD dock with deterministic
+local replies and a separate streaming-response parser check, as well as native
+assembly and motion. The dock test executes the box/cylinder/placement/view
+sequence across multiple reply rounds and forces GUI event re-entry while applying
+tools. It does not contact a model or
+modify the user's Agent connection settings. Set `KINESKETCH_AGENT_ARTIFACT_DIR`
+to a new output directory to retain its FCStd model, viewport PNG, and JSON report.
+This local test must be distinguished from a live model/SSH test.
 
 ## Build
 
