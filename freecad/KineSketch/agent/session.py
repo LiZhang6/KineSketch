@@ -47,8 +47,8 @@ Centre the slider body at local x=0,y=0,z=0. All additive features within
 each part must touch or overlap into one solid. Infer reasonable unspecified
 thicknesses and clearances; do not invent a different mechanism.
 This geometry skill and the Assembly/Kinematic skills support this topology only.
-If the tool rejects a feature plan, correct its reported issue and retry within
-the tool-round limit. Use replay_slider_crank for a later replay request. Do not
+If the tool rejects a feature plan, correct its reported issue and retry.
+Use replay_slider_crank for a later replay request. Do not
 approximate this mechanism with unrelated standalone primitive tool calls and
 do not emit Python code for execution. When visual inspection is useful, call
 capture_viewport. Its image arrives in the next user message. Describe only
@@ -86,8 +86,7 @@ POST_ACTION_REVIEW_PROMPT = (
 class AgentSession:
     """Maintain a bounded chat history across asynchronous model requests."""
 
-    def __init__(self, max_tool_rounds: int = 6) -> None:
-        self.max_tool_rounds = max_tool_rounds
+    def __init__(self) -> None:
         self._tool_rounds = 0
         self._messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -257,8 +256,6 @@ class AgentSession:
 
     def continue_after_tools(self) -> None:
         self._tool_rounds += 1
-        if self._tool_rounds >= self.max_tool_rounds:
-            raise RuntimeError("Agent exceeded the maximum number of tool rounds")
 
     def clear(self) -> None:
         self._tool_rounds = 0
